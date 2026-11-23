@@ -37,6 +37,33 @@ pub struct HealthIcon {
     /// Bop tween: (from, elapsed, duration).
     bop: Option<(f32, f32, f32)>,
     state: State,
+    /// The icon's most common colour (Psych Engine's `CoolUtil.dominantColor`),
+    /// used for the Psych Engine health bar.
+    pub color: [f32; 3],
+}
+
+/// `CoolUtil.dominantColor`: the most common colour in the first frame,
+/// ignoring fully transparent pixels and pure black.
+fn dominant_color(path: &std::path::Path, frame: u32) -> [f32; 3] {
+    let fallback = [161.0 / 255.0; 3];
+    let Some(img) = funkin_core::vfs::read(path).ok().and_then(|b| image::load_from_memory(&b).ok()) else {
+        return fallback;
+    };
+    let img = img.to_rgba8();
+    let mut counts: std::collections::HashMap<[u8; 4], u32> = std::collections::HashMap::new();
+    for y in 0..frame.min(img.height()) {
+        for x in 0..frame.min(img.width()) {
+            let p = img.get_pixel(x, y).0;
+            if p[3] != 0 && p != [0, 0, 0, 255] {
+                *counts.entry(p).or_default() += 1;
+            }
+        }
+    }
+    // Ties go to the lowest colour value, so the pick doesn't vary between runs.
+    match counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))) {
+        Some((c, _)) => [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0],
+        None => fallback,
+    }
 }
 
 /// `healthIcon` from `data/characters/<id>.json`, with `CharacterData` defaults.
@@ -86,6 +113,7 @@ impl HealthIcon {
         let tex = gfx.load_texture_filtered(&p, !is_pixel).map_err(|e| log::warn!("health icon: {e}")).ok()?;
         let (tw, th) = gfx.texture_size(tex);
         let frame = if is_pixel { PIXEL_ICON_SIZE } else { ICON_SIZE };
+        let color = dominant_color(&p, frame as u32);
         let cols = ((tw / frame).floor() as usize).max(1);
         let rows = ((th / frame).floor() as usize).max(1);
         // BF looks the other way.
@@ -103,6 +131,7 @@ impl HealthIcon {
             width: ICON_SIZE * d.scale,
             bop: None,
             state: State::Idle,
+            color,
         })
     }
 

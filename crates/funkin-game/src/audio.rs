@@ -83,7 +83,8 @@ enum Command {
         looped: Option<(f64, f64)>,
     },
     Stop,
-    Sfx(Arc<Pcm>, f32),
+    Sfx(Arc<Pcm>, f32, u64),
+    StopSfx(u64),
     /// Freeze (or continue) the song tracks; sound effects and the overlay keep playing.
     Pause(bool),
     /// A second looping track over everything (the pause menu's music).
@@ -106,6 +107,9 @@ struct Clock {
     /// to the latest once this matches [`Audio::play`]'s return value.
     generation: AtomicU64,
 }
+
+/// Ids for [`Audio::play_sfx_tracked`].
+static NEXT_SFX: AtomicU64 = AtomicU64::new(1);
 
 fn epoch() -> Instant {
     static E: OnceLock<Instant> = OnceLock::new();
@@ -130,7 +134,7 @@ struct Mixer {
     frame: i64,
     /// Loop region `[start, end)` in ms; the clock keeps counting through it.
     looped: Option<(f64, f64)>,
-    sfx: Vec<(Arc<Pcm>, f64, f32)>,
+    sfx: Vec<(Arc<Pcm>, f64, f32, u64)>,
     paused: bool,
     overlay: Option<(Arc<Track>, f64)>,
     generation: u64,
@@ -152,7 +156,8 @@ impl Mixer {
                     self.tracks.clear();
                     self.clock.playing.store(false, Ordering::Release);
                 }
-                Command::Sfx(pcm, vol) => self.sfx.push((pcm, 0.0, vol)),
+                Command::Sfx(pcm, vol, id) => self.sfx.push((pcm, 0.0, vol, id)),
+                Command::StopSfx(id) => self.sfx.retain(|s| s.3 != id),
                 Command::Pause(p) => {
                     self.paused = p;
                     self.clock.paused.store(p, Ordering::Release);
@@ -193,7 +198,7 @@ impl Mixer {
                     r += sr * v;
                 }
             }
-            for (pcm, pos, vol) in &mut self.sfx {
+            for (pcm, pos, vol, _) in &mut self.sfx {
                 let (sl, sr) = sample(pcm, *pos);
                 l += sl * *vol;
                 r += sr * *vol;
@@ -221,7 +226,7 @@ impl Mixer {
             }
         }
         self.sfx
-            .retain(|(pcm, pos, _)| (*pos as usize) < pcm.frames());
+            .retain(|(pcm, pos, _, _)| (*pos as usize) < pcm.frames());
     }
 }
 
@@ -312,9 +317,9 @@ impl Audio {
 
     /// Start looping music: plays from `start_ms`, wrapping `[loop_start, loop_end)`.
     /// The clock (`song_time_at`) keeps increasing across loops.
-    pub fn play_looped(&self, tracks: Vec<Arc<Track>>, start_ms: f64, loop_start: f64, loop_end: f64) {
+    pub fn play_looped(&self, tracks: Vec<Arc<Track>>, start_ms: f64, loop_start: f64, loop_end: f64) -> u64 {
         let _ = self.tx.send(Command::Play { tracks, start_ms, looped: Some((loop_start, loop_end)) });
-        self.plays.fetch_add(1, Ordering::AcqRel);
+        self.plays.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn stop(&self) {
@@ -343,7 +348,18 @@ impl Audio {
     }
 
     pub fn play_sfx(&self, pcm: Arc<Pcm>, volume: f32) {
-        let _ = self.tx.send(Command::Sfx(pcm, volume));
+        self.play_sfx_tracked(pcm, volume);
+    }
+
+    /// A sound effect that can be stopped early with [`Audio::stop_sfx`].
+    pub fn play_sfx_tracked(&self, pcm: Arc<Pcm>, volume: f32) -> u64 {
+        let id = NEXT_SFX.fetch_add(1, Ordering::Relaxed);
+        let _ = self.tx.send(Command::Sfx(pcm, volume, id));
+        id
+    }
+
+    pub fn stop_sfx(&self, id: u64) {
+        let _ = self.tx.send(Command::StopSfx(id));
     }
 
     /// The song position (ms) that is audible at `at`.

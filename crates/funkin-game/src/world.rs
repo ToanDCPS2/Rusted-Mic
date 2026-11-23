@@ -25,6 +25,12 @@ pub struct Character {
     sing_time_steps: f64,
     hold_timer: f64,
     pub focus: [f64; 2],
+    /// The character id (`characterId`).
+    pub id: String,
+    /// `getDeathCameraOffsets`, `getDeathCameraZoom`, `getDeathPreTransitionDelay`.
+    pub death: funkin_core::stage::DeathData,
+    /// Where the game over camera looks (`GameOverSubState.setCameraTarget`).
+    pub death_focus: [f64; 2],
 }
 
 fn dir_upper(d: NoteDirection) -> &'static str {
@@ -76,7 +82,12 @@ impl Character {
             (actor.y + h / 2.0) as f64 + data.camera_offsets[1] + slot.camera_offsets[1],
         ];
         log::debug!("character {id}: size {:?} pos ({}, {}) focus {:?}", actor.size(), actor.x, actor.y, focus);
-        Ok(Self { actor, kind, sing_time_steps: data.sing_time, hold_timer: 0.0, focus })
+        let death = data.death.clone().unwrap_or_default();
+        let death_focus = [
+            focus[0] - data.camera_offsets[0].trunc() - slot.camera_offsets[0].trunc() + death.camera_offsets[0],
+            focus[1] - data.camera_offsets[1].trunc() - slot.camera_offsets[1].trunc() + death.camera_offsets[1],
+        ];
+        Ok(Self { actor, kind, sing_time_steps: data.sing_time, hold_timer: 0.0, focus, id: id.to_owned(), death, death_focus })
     }
 
     fn is_singing(&self) -> bool {

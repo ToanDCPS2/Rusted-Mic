@@ -1,8 +1,10 @@
 //! Player settings (`Preferences.hx` + `Save.options`) and key bindings
 //! (`Controls.hx`), saved as JSON in the data folder.
 //!
-//! Two settings are new to Rusted Mic: **Middlescroll** (the player's notes in
-//! the middle of the screen) and **Hide Opponent Notes**.
+//! Some settings are new to Rusted Mic: **Middlescroll** (the player's notes in
+//! the middle of the screen), **Hide Opponent Notes**, **Ghost Tapping** (the
+//! original only has it on mobile builds), and Psych Engine's **time bar** and
+//! **health bar**.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -33,6 +35,12 @@ pub struct Settings {
     pub middlescroll: bool,
     /// New: the opponent's strumline and notes are not drawn.
     pub hide_opponent_notes: bool,
+    /// New on desktop: pressing a key with no note to hit isn't penalized.
+    pub ghost_tapping: bool,
+    /// New: Psych Engine's song time bar at the top of the screen.
+    pub psych_time_bar: bool,
+    /// New: Psych Engine's health bar, in the characters' colours.
+    pub psych_health_bar: bool,
     /// Percent (0..=100).
     pub strumline_background: i32,
     pub flashing_lights: bool,
@@ -67,6 +75,9 @@ impl Default for Settings {
             downscroll: false,
             middlescroll: false,
             hide_opponent_notes: false,
+            ghost_tapping: false,
+            psych_time_bar: false,
+            psych_health_bar: false,
             strumline_background: 0,
             flashing_lights: true,
             zoom_camera: true,

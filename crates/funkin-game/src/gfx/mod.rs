@@ -4,6 +4,7 @@
 
 pub mod animate;
 pub mod atlas;
+pub mod rain;
 pub mod text;
 pub mod ttf;
 
@@ -120,6 +121,10 @@ pub struct Gfx {
     /// Read the next presented frame back (screenshots).
     capture: bool,
     captured: Option<(u32, u32, Vec<u8>)>,
+    rain_pass: rain::RainPass,
+    /// This frame's post effect: the batch count when [`Gfx::rain`] was called
+    /// (earlier batches get the effect) and its parameters.
+    post: Option<(usize, rain::RainParams)>,
 }
 
 const SHADER: &str = r#"
@@ -275,7 +280,10 @@ impl Gfx {
             mapped_at_creation: false,
         });
 
+        let rain_pass = rain::RainPass::new(&device, config.format);
         let mut gfx = Self {
+            rain_pass,
+            post: None,
             window,
             surface,
             device,
@@ -512,8 +520,10 @@ impl Gfx {
             });
         }
         let blend = self.blend;
+        // Never merge across the post-effect split.
+        let split = self.post.map(|(k, _)| k == self.batches.len()).unwrap_or(false);
         match self.batches.last_mut() {
-            Some((t, b, _, end)) if *t == tex && *b == blend => *end = start + 6,
+            Some((t, b, _, end)) if *t == tex && *b == blend && !split => *end = start + 6,
             _ => self.batches.push((tex, blend, start, start + 6)),
         }
     }
@@ -555,8 +565,27 @@ impl Gfx {
         self.image(white, [0.0, 0.0, 1.0, 1.0], x, y, w, h, color);
     }
 
+    /// Apply Weekend 1's rain to everything drawn so far this frame (the
+    /// game camera); what is drawn afterwards (the HUD) is unaffected.
+    pub fn rain(&mut self, params: rain::RainParams) {
+        self.post = Some((self.batches.len(), params));
+    }
+
+    fn draw_batches(&self, pass: &mut wgpu::RenderPass<'_>, batches: &[(TexId, Blend, u32, u32)]) {
+        for &(tex, blend, start, end) in batches {
+            pass.set_pipeline(&self.pipelines[blend as usize]);
+            // A released texture draws as plain white instead of crashing.
+            let t = self.textures.get(tex.0).and_then(Option::as_ref).or(self.textures[self.white.0].as_ref());
+            if let Some(t) = t {
+                pass.set_bind_group(0, &t.bind_group, &[]);
+            }
+            pass.draw(start..end, 0..1);
+        }
+    }
+
     /// Submit everything queued this frame.
     pub fn present(&mut self) {
+        let post = self.post.take();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -564,11 +593,13 @@ impl Gfx {
                 self.surface.configure(&self.device, &self.config);
                 self.vertices.clear();
                 self.batches.clear();
+                self.post = None;
                 return;
             }
             _ => {
                 self.vertices.clear();
                 self.batches.clear();
+                self.post = None;
                 return;
             }
         };
@@ -595,6 +626,31 @@ impl Gfx {
 
         let view = frame.texture.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
+        let batches = std::mem::take(&mut self.batches);
+        let mut split = 0;
+        if let Some((k, params)) = post {
+            // The game camera's image, at the letterboxed size, for the rain pass.
+            split = k.min(batches.len());
+            let (tw, th) = ((vw.round() as u32).max(1), (vh.round() as u32).max(1));
+            let target = self.rain_pass.target(&self.device, &self.sampler, self.config.format, tw, th).clone();
+            self.rain_pass.write(&self.queue, params);
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(0.0, 0.0, tw as f32, th as f32, 0.0, 1.0);
+            pass.set_vertex_buffer(0, self.vbuf.slice(..));
+            self.draw_batches(&mut pass, &batches[..split]);
+        }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -613,17 +669,13 @@ impl Gfx {
                 multiview_mask: None,
             });
             pass.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
-            pass.set_vertex_buffer(0, self.vbuf.slice(..));
-            for &(tex, blend, start, end) in &self.batches {
-                pass.set_pipeline(&self.pipelines[blend as usize]);
-                // A released texture draws as plain white instead of crashing.
-                let t = self.textures.get(tex.0).and_then(Option::as_ref).or(self.textures[self.white.0].as_ref());
-                if let Some(t) = t {
-                    pass.set_bind_group(0, &t.bind_group, &[]);
-                }
-                pass.draw(start..end, 0..1);
+            if post.is_some() {
+                self.rain_pass.draw(&mut pass);
             }
+            pass.set_vertex_buffer(0, self.vbuf.slice(..));
+            self.draw_batches(&mut pass, &batches[split..]);
         }
+        self.batches = batches;
         let readback = if std::mem::take(&mut self.capture)
             && self.config.usage.contains(wgpu::TextureUsages::COPY_SRC)
         {

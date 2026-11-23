@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "funkin-assets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "funkin-core",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "funkin-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "semver",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "rusted-mic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "cpal",

@@ -18,10 +18,12 @@ mod actor;
 mod app;
 mod assets;
 mod audio;
+mod game_over;
 mod gfx;
 mod health_icon;
 mod logo;
 mod menus;
+mod notestyle;
 #[cfg(feature = "importer")]
 mod setup_screen;
 mod discord;

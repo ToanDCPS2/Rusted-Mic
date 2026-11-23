@@ -226,6 +226,12 @@ impl GameCamera {
                 self.zoom_tween = None;
             }
         }
+        self.update_follow(elapsed, DEFAULT_CAMERA_FOLLOW_RATE);
+    }
+
+    /// Move towards the follow point: its tween if one is running, else
+    /// FlxCamera's LOCKON follow with lerp `rate` (per 60 fps frame).
+    pub fn update_follow(&mut self, elapsed: f64, rate: f64) {
         if let Some(t) = &mut self.follow_tween {
             t.elapsed += elapsed;
             self.scroll = t.value();
@@ -233,9 +239,8 @@ impl GameCamera {
                 self.follow_tween = None;
             }
         } else {
-            // FlxCamera LOCKON follow with lerp, frame-rate corrected.
             let target = self.target_scroll();
-            let k = 1.0 - (1.0 - DEFAULT_CAMERA_FOLLOW_RATE).powf(dt);
+            let k = 1.0 - (1.0 - rate).powf(elapsed * 60.0);
             self.scroll[0] += (target[0] - self.scroll[0]) * k;
             self.scroll[1] += (target[1] - self.scroll[1]) * k;
         }

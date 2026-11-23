@@ -69,6 +69,15 @@ impl Assets {
         gfx.load_texture(&self.image_path(spec))
     }
 
+    /// A texture with nearest-neighbour filtering when `smooth` is false (pixel art).
+    pub fn texture_filtered(&self, gfx: &mut Gfx, spec: &str, smooth: bool) -> Result<TexId, String> {
+        gfx.load_texture_filtered(&self.image_path(spec), smooth)
+    }
+
+    pub fn atlas_filtered(&self, gfx: &mut Gfx, spec: &str, smooth: bool) -> Result<Atlas, String> {
+        Atlas::load_filtered(gfx, &self.image_path(spec).with_extension(""), smooth)
+    }
+
     pub fn atlas(&self, gfx: &mut Gfx, spec: &str) -> Result<Atlas, String> {
         Atlas::load(gfx, &self.image_path(spec).with_extension(""))
     }

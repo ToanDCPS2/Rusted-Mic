@@ -12,7 +12,6 @@ use funkin_core::state::PlayRequest;
 
 use crate::assets::Assets;
 use crate::audio::{Audio, Pcm, Track};
-use crate::gfx::atlas::{Anim, Atlas};
 use crate::gfx::text::Font;
 use crate::gfx::{Affine, Gfx, TexId, VIEW_H, VIEW_W, WHITE};
 use crate::gfx::ttf::TtfFont;
@@ -24,30 +23,13 @@ const STRUMLINE_SIZE: f32 = 104.0;
 const NOTE_SPACING: f32 = STRUMLINE_SIZE + 8.0;
 const STRUMLINE_X_OFFSET: f32 = 48.0;
 const STRUMLINE_Y_OFFSET: f32 = 24.0;
-const NOTE_SCALE: f32 = 0.7;
+/// `Strumline.NUDGE`: notes sit 2 px left of the lane centre.
+const NOTE_NUDGE: f32 = 2.0;
 const ANIM_FPS: f32 = 24.0;
 /// `Strumline.INITIAL_OFFSET`.
 const RECEPTOR_INITIAL_OFFSET: f32 = -0.275 * STRUMLINE_SIZE;
 
-/// Shared, per-note-style graphics. Loaded once and reused across songs.
-pub struct NoteSkin {
-    notes: Atlas,
-    note_frames: [usize; 4],
-    strum: Atlas,
-    statics: [Anim; 4],
-    presses: [Anim; 4],
-    confirms: [Anim; 4],
-    hold: TexId,
-    ratings: [TexId; 4],
-    rating_sizes: [(f32, f32); 4],
-    digits: [TexId; 10],
-    health_bar: TexId,
-    countdown: [Option<TexId>; 3],
-    countdown_sfx: [Option<Arc<Pcm>>; 4],
-    miss_sfx: Vec<Arc<Pcm>>,
-    /// Hold covers per lane: atlas and (start, hold, end) animations.
-    covers: Vec<(Atlas, [Anim; 3])>,
-}
+pub use crate::notestyle::NoteSkin;
 
 /// Display preferences that shape the gameplay HUD.
 #[derive(Debug, Clone, Copy, Default)]
@@ -55,6 +37,12 @@ pub struct PlayPrefs {
     pub downscroll: bool,
     pub middlescroll: bool,
     pub hide_opponent: bool,
+    /// Key presses with no note to hit aren't penalized.
+    pub ghost_tapping: bool,
+    /// Psych Engine's time bar.
+    pub psych_time_bar: bool,
+    /// Psych Engine's health bar.
+    pub psych_health_bar: bool,
     /// Strumline background opacity, 0..1.
     pub strumline_bg: f32,
     pub zoom_camera: bool,
@@ -104,94 +92,6 @@ fn parse_srt(s: &str) -> Vec<Subtitle> {
     out
 }
 
-impl NoteSkin {
-    /// A receptor: `state` 0 static, 1 pressed, 2 confirm (`t` seconds in).
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_receptor(&self, gfx: &mut Gfx, lane: usize, state: u8, t: f32, cx: f32, cy: f32, alpha: f32) {
-        let (anim, t) = match state {
-            0 => (&self.statics[lane], 0.0),
-            1 => (&self.presses[lane], 0.0),
-            _ => (&self.confirms[lane], t),
-        };
-        if let Some(f) = anim.frame_at(t, ANIM_FPS, false) {
-            self.strum.draw_centered(gfx, f, cx, cy, NOTE_SCALE, [1.0, 1.0, 1.0, alpha]);
-        }
-    }
-
-    pub fn draw_note(&self, gfx: &mut Gfx, lane: usize, cx: f32, cy: f32, alpha: f32) {
-        self.notes.draw_centered(gfx, self.note_frames[lane], cx, cy, NOTE_SCALE, [1.0, 1.0, 1.0, alpha]);
-    }
-
-    pub fn load(gfx: &mut Gfx, a: &Assets) -> Result<Self, String> {
-        let notes = a.atlas(gfx, "shared:notes")?;
-        let strum = a.atlas(gfx, "shared:noteStrumline")?;
-        let dirs = ["Left", "Down", "Up", "Right"];
-        let note_frames = dirs.map(|d| {
-            notes
-                .prefix(&format!("note{d}"))
-                .frames
-                .first()
-                .copied()
-                .unwrap_or(0)
-        });
-        let statics = dirs.map(|d| strum.prefix(&format!("static{d}0")));
-        let presses = dirs.map(|d| strum.prefix(&format!("press{d}0")));
-        let confirms = dirs.map(|d| strum.prefix(&format!("confirm{d}0")));
-        let mut rating = |n: &str| a.texture(gfx, &format!("default:ui/popup/funkin/{n}"));
-        let ratings = [
-            rating("sick")?,
-            rating("good")?,
-            rating("bad")?,
-            rating("shit")?,
-        ];
-        let mut covers = Vec::new();
-        for color in ["Purple", "Blue", "Green", "Red"] {
-            match a.atlas(gfx, &format!("shared:holdCover{color}")) {
-                Ok(at) => {
-                    let anims = [
-                        at.prefix(&format!("holdCoverStart{color}")),
-                        at.prefix(&format!("holdCover{color}0")),
-                        at.prefix(&format!("holdCoverEnd{color}")),
-                    ];
-                    covers.push((at, anims));
-                }
-                Err(e) => log::warn!("hold cover: {e}"),
-            }
-        }
-        if covers.len() != 4 {
-            covers.clear();
-        }
-        let rating_sizes = ratings.map(|t| gfx.texture_size(t));
-        let mut digits = [ratings[0]; 10];
-        for (i, d) in digits.iter_mut().enumerate() {
-            *d = a.texture(gfx, &format!("default:ui/popup/funkin/num{i}"))?;
-        }
-        Ok(Self {
-            note_frames,
-            statics,
-            presses,
-            confirms,
-            hold: a.texture(gfx, "shared:NOTE_hold_assets")?,
-            ratings,
-            rating_sizes,
-            digits,
-            health_bar: a.texture(gfx, "shared:healthBar")?,
-            countdown: ["ready", "set", "go"].map(|n| {
-                a.texture(gfx, &format!("shared:ui/countdown/funkin/{n}"))
-                    .ok()
-            }),
-            countdown_sfx: ["THREE", "TWO", "ONE", "GO"]
-                .map(|n| a.sound(&format!("shared:gameplay/countdown/funkin/intro{n}"))),
-            miss_sfx: (1..=3)
-                .filter_map(|i| a.sound(&format!("shared:missnote{i}")))
-                .collect(),
-            covers,
-            notes,
-            strum,
-        })
-    }
-}
-
 /// Receptor animation state (`StrumlineNote`).
 #[derive(Clone, Copy, PartialEq)]
 enum StrumAnim {
@@ -231,11 +131,67 @@ struct Popup {
     ay: f32,
     age: f32,
     delay: f32,
+    /// Pixel styles: a two-step fade (`EaseUtil.stepped(2)`) and whole-pixel positions.
+    pixel: bool,
+}
+
+/// The rain on Weekend 1's stages (`phillyStreets.hxc` / `phillyStreetsErect.hxc`).
+struct Rain {
+    /// Intensity at the song's start and end (it's remapped over the song).
+    start: f32,
+    end: f32,
+    color: [f32; 3],
+    /// `RuntimeRainShader.time` (starts at 1).
+    time: f32,
+}
+
+impl Rain {
+    fn for_stage(stage: &str, song: &str) -> Option<Self> {
+        let erect = match stage {
+            "phillyStreets" => false,
+            "phillyStreetsErect" => true,
+            _ => return None,
+        };
+        let (start, end) = match song {
+            "darnell" => (0.0, 0.1),
+            "lit-up" => (0.1, 0.2),
+            "2hot" => (0.2, 0.4),
+            _ => (0.0, 0.0),
+        };
+        // Erect: a tenth of the intensity, grey rain.
+        let (k, rgb) = if erect { (0.1, 0xa8adb5u32) } else { (1.0, 0x6680cc) };
+        let c = |sh: u32| ((rgb >> sh) & 0xff) as f32 / 255.0;
+        Some(Self { start: start * k, end: end * k, color: [c(16), c(8), c(0)], time: 1.0 })
+    }
+
+    fn params(&self, cam: &funkin_core::camera::GameCamera, pos_ms: f64, len_ms: f64) -> crate::gfx::rain::RainParams {
+        // FlxMath.remapToRange(songPosition, 0, music.length, start, end)
+        let t = if len_ms > 0.0 { (pos_ms / len_ms) as f32 } else { 0.0 };
+        let intensity = self.start + (self.end - self.start) * t;
+        // FlxCamera.viewLeft/Top/Right/Bottom.
+        let z = cam.zoom();
+        let (w, h) = (cam.view_w / z, cam.view_h / z);
+        let left = cam.scroll[0] + (cam.view_w - w) / 2.0;
+        let top = cam.scroll[1] + (cam.view_h - h) / 2.0;
+        crate::gfx::rain::RainParams {
+            bounds: [left as f32, top as f32, (left + w) as f32, (top + h) as f32],
+            color: self.color,
+            scale: VIEW_H / 200.0,
+            intensity,
+            time: self.time,
+        }
+    }
+}
+
+/// `EaseUtil.stepped(steps)`.
+fn stepped(t: f32, steps: f32) -> f32 {
+    (t * steps).floor() / steps
 }
 
 impl Popup {
     fn alpha(&self) -> f32 {
-        (1.0 - (self.age - self.delay) / 0.2).clamp(0.0, 1.0)
+        let k = ((self.age - self.delay) / 0.2).clamp(0.0, 1.0);
+        1.0 - if self.pixel { stepped(k, 2.0) } else { k }
     }
 
     /// `FlxObject.updateMotion` (half the acceleration before and after the move).
@@ -292,11 +248,20 @@ pub struct PlayScene {
     popup_combo: u32,
     last_countdown_beat: i64,
     countdown_shown: Option<(usize, f64)>,
+    /// Weekend 1's rain shader (Philly Streets stages only).
+    rain: Option<Rain>,
+    /// The game over screen, once the player has died.
+    death: Option<crate::game_over::GameOver>,
+    /// Retrying after a game over: the game camera fades in from black
+    /// (elapsed seconds, and whether in RetroCameraFade's 10 steps).
+    intro_fade: Option<(f32, bool)>,
     rng: u64,
     pub title: String,
     pub song_name: String,
     pub artist: String,
     pub charter: Option<String>,
+    /// The song's note style (`playData.noteStyle`).
+    pub note_style: String,
     /// The chart's `stickerPack`, if any.
     pub sticker_pack: Option<String>,
     /// The player character id.
@@ -347,6 +312,7 @@ impl PlayScene {
             scroll_speed,
             botplay,
             practice,
+            ghost_tapping: prefs.ghost_tapping,
             ..Default::default()
         };
         let session =
@@ -417,6 +383,7 @@ impl PlayScene {
             "{} ({}) - {}",
             meta.song_name, request.difficulty, meta.artist
         );
+        let rain = Rain::for_stage(&meta.play_data.stage, &request.song_id);
         Ok(Self {
             request,
             session,
@@ -445,11 +412,15 @@ impl PlayScene {
             popup_combo: 0,
             last_countdown_beat: i64::MIN,
             countdown_shown: None,
+            rain,
+            death: None,
+            intro_fade: None,
             rng: 0x9E37_79B9_7F4A_7C15,
             title,
             song_name: meta.song_name.clone(),
             artist: meta.artist.clone(),
             charter: meta.charter.clone(),
+            note_style: if meta.play_data.note_style.is_empty() { "funkin".into() } else { meta.play_data.note_style.clone() },
             sticker_pack: meta.play_data.sticker_pack.clone(),
             player: chars.player.clone(),
             opponent: chars.opponent.clone(),
@@ -459,6 +430,54 @@ impl PlayScene {
             subtitles,
             reset: false,
         })
+    }
+
+    /// The player died: open the game over screen. False if there's no stage
+    /// to show it on (the plain game over screen is used then).
+    pub fn start_death(&mut self, gfx: &mut Gfx, assets: &Assets, naughty: bool) -> bool {
+        let Some(w) = &mut self.world else { return false };
+        self.popups.clear();
+        self.death = Some(crate::game_over::GameOver::new(gfx, assets, w, &self.opponent, naughty));
+        true
+    }
+
+    pub fn death_update(&mut self, dt: f32, audio: &Audio, assets: &Assets) -> crate::game_over::DeathAction {
+        match (&mut self.death, &mut self.world) {
+            (Some(d), Some(w)) => d.update(dt, w, audio, assets),
+            _ => crate::game_over::DeathAction::None,
+        }
+    }
+
+    pub fn death_confirm(&mut self, audio: &Audio, assets: &Assets) {
+        if let (Some(d), Some(w)) = (&mut self.death, &mut self.world) {
+            d.confirm(w, audio, assets);
+        }
+    }
+
+    /// Whether Back may leave the game over screen (`goBack`'s checks).
+    pub fn death_can_go_back(&self) -> bool {
+        self.death.as_ref().is_none_or(|d| d.can_go_back())
+    }
+
+    pub fn death_stop(&mut self, audio: &Audio) {
+        if let Some(d) = &mut self.death {
+            d.stop(audio);
+        }
+    }
+
+    pub fn has_death(&self) -> bool {
+        self.death.is_some()
+    }
+
+    pub fn draw_death(&self, gfx: &mut Gfx) {
+        if let (Some(d), Some(w)) = (&self.death, &self.world) {
+            d.draw(gfx, w);
+        }
+    }
+
+    /// Fade the game camera in from black (after a retry).
+    pub fn fade_in(&mut self, pixel: bool) {
+        self.intro_fade = Some((0.0, pixel));
     }
 
     /// The global offset changed (pause menu): applies immediately.
@@ -480,9 +499,9 @@ impl PlayScene {
         self.reset = true;
     }
 
-    /// Strumline layout: the centre x of each lane per side (None = hidden),
-    /// the receptors' centre y, and each side's alpha.
-    fn layout(&self) -> ([[Option<f32>; 4]; 2], f32, [f32; 2]) {
+    /// Strumline layout: the centre x of each lane per side (None = hidden)
+    /// and each side's alpha.
+    fn layout(&self) -> ([[Option<f32>; 4]; 2], [f32; 2]) {
         let p = &self.prefs;
         let lane = |base: f32, i: usize| base + i as f32 * NOTE_SPACING + STRUMLINE_SIZE / 2.0;
         let mut xs = [[None; 4]; 2];
@@ -508,8 +527,25 @@ impl PlayScene {
         if p.hide_opponent {
             xs[1] = [None; 4];
         }
-        let top = STRUMLINE_Y_OFFSET + STRUMLINE_SIZE / 2.0;
-        (xs, if p.downscroll { VIEW_H - top } else { top }, alpha)
+        (xs, alpha)
+    }
+
+    /// The strumlines' y (`PlayState`): `STRUMLINE_Y_OFFSET` from the top, or
+    /// in downscroll `height - strumline.height - STRUMLINE_Y_OFFSET - offsets[1]`,
+    /// where the strumline's height is its receptors' hitbox height.
+    ///
+    /// With the Psych Engine time bar on, Psych's placement is used instead:
+    /// the receptors' top at 50, or `height - 150` in downscroll.
+    fn strum_y(&self, skin: &NoteSkin) -> f32 {
+        if self.prefs.psych_time_bar {
+            let top = if self.prefs.downscroll { VIEW_H - 150.0 } else { 50.0 };
+            return top - skin.strum_off[1];
+        }
+        if self.prefs.downscroll {
+            VIEW_H - skin.strum_size.1 - STRUMLINE_Y_OFFSET - skin.strum_off[1]
+        } else {
+            STRUMLINE_Y_OFFSET
+        }
     }
 
     fn song_time(&self, audio: &Audio, at: Instant) -> f64 {
@@ -570,7 +606,7 @@ impl PlayScene {
         self.popup_combo = 0;
     }
 
-    /// `PopUpStuff.displayRating` (funkin style: scale 0.65, no offsets).
+    /// `PopUpStuff.displayRating` (no style offsets in the base game's styles).
     fn display_rating(&mut self, skin: &NoteSkin, j: Judgement) {
         let idx = match j {
             Judgement::Sick => 0,
@@ -580,7 +616,7 @@ impl PlayScene {
         };
         let tex = skin.ratings[idx];
         let (w, h) = skin.rating_sizes[idx];
-        let scale = 0.65;
+        let scale = skin.rating_scale;
         let (w, h) = ((w * scale).abs(), (h * scale).abs());
         let vy = -self.rand_int(140, 175);
         let vx = -self.rand_int(0, 10);
@@ -594,6 +630,7 @@ impl PlayScene {
             ay: 550.0,
             age: 0.0,
             delay: (self.beat_ms * 0.001) as f32,
+            pixel: skin.popup_pixel,
         });
     }
 
@@ -614,7 +651,7 @@ impl PlayScene {
             let vx = self.rand_float(-5.0, 5.0);
             self.popups.push(Popup {
                 tex: skin.digits[d],
-                scale: 0.45,
+                scale: skin.digit_scale,
                 x: VIEW_W * 0.507 - 36.0 * (i + 1) as f32 - 65.0,
                 y: VIEW_H * 0.44,
                 vx,
@@ -622,6 +659,7 @@ impl PlayScene {
                 ay,
                 age: 0.0,
                 delay: (self.beat_ms * 0.002) as f32,
+                pixel: skin.popup_pixel,
             });
         }
     }
@@ -805,6 +843,15 @@ impl PlayScene {
             .map(|t| now.duration_since(t).as_secs_f64().min(0.1))
             .unwrap_or(0.0);
         self.last_frame = Some(now);
+        if let Some(r) = &mut self.rain {
+            r.time += elapsed as f32;
+        }
+        if let Some((t, _)) = &mut self.intro_fade {
+            *t += elapsed as f32;
+            if *t >= 1.0 {
+                self.intro_fade = None;
+            }
+        }
         for p in &mut self.popups {
             p.update(elapsed as f32);
         }
@@ -857,6 +904,14 @@ impl PlayScene {
             Some(w) => {
                 gfx.begin([0.0, 0.0, 0.0, 1.0]);
                 w.draw(gfx);
+                if let Some((t, pixel)) = self.intro_fade {
+                    // FlxG.camera.fade(BLACK, 1, true) after a retry.
+                    let k = if pixel { (t * 10.0).floor() / 10.0 } else { t };
+                    gfx.rect(0.0, 0.0, VIEW_W, VIEW_H, [0.0, 0.0, 0.0, 1.0 - k.clamp(0.0, 1.0)]);
+                }
+                if let Some(r) = &self.rain {
+                    gfx.rain(r.params(&w.camera, self.song_pos, self.song_length_ms));
+                }
                 let z = w.camera.hud_zoom as f32;
                 gfx.set_transform(Affine::zoom_about(z, VIEW_W / 2.0, VIEW_H / 2.0));
             }
@@ -868,9 +923,12 @@ impl PlayScene {
 
     fn draw_hud_layer(&self, gfx: &mut Gfx, skin: &NoteSkin, font: &Font, vcr: Option<&TtfFont>) {
         let pos = self.song_pos;
-        let (xs, strum_cy, side_alpha) = self.layout();
+        let (xs, side_alpha) = self.layout();
         let sign = if self.prefs.downscroll { -1.0 } else { 1.0 };
         let px_per_ms = (PIXELS_PER_MS * self.scroll_speed) as f32;
+        let sy = self.strum_y(skin);
+        // `Strumline.getXPos` + the strumline's x: each lane's left edge.
+        let lane_x = |cx: f32| cx - STRUMLINE_SIZE / 2.0;
 
         // zIndex order: health bar 800, icons 850, combo popups 900, strumlines 1000+.
         self.draw_hud(gfx, skin, font, vcr);
@@ -889,6 +947,12 @@ impl PlayScene {
             }
         }
 
+        // StrumlineNote: placed at INITIAL_OFFSET + the style's offsets; every
+        // animation is centred on the hitbox (`centerOffsets`).
+        let (rw, rh) = skin.strum_size;
+        let receptor_cy = sy + skin.strum_off[1] + rh / 2.0;
+        let receptor_dx = RECEPTOR_INITIAL_OFFSET + skin.strum_off[0] + rw / 2.0;
+
         for side in [1usize, 0] {
             let line = if side == 0 {
                 &self.session.player
@@ -900,15 +964,15 @@ impl PlayScene {
             // Receptors.
             for lane in 0..4 {
                 let Some(cx) = xs[side][lane] else { continue };
-                let (anim, t, looped) = match self.strums[side][lane] {
-                    StrumAnim::Static => (&skin.statics[lane], 0.0, false),
-                    StrumAnim::Press => (&skin.presses[lane], 0.0, false),
+                let (anim, t) = match self.strums[side][lane] {
+                    StrumAnim::Static => (&skin.statics[lane], 0.0),
+                    StrumAnim::Press => (&skin.presses[lane], 0.0),
                     StrumAnim::Confirm { since } | StrumAnim::ConfirmHold { since } => {
-                        (&skin.confirms[lane], ((pos - since) / 1000.0) as f32, false)
+                        (&skin.confirms[lane], ((pos - since) / 1000.0) as f32)
                     }
                 };
-                if let Some(f) = anim.frame_at(t, ANIM_FPS, looped) {
-                    skin.strum.draw_centered(gfx, f, cx, strum_cy, NOTE_SCALE, [1.0, 1.0, 1.0, sa]);
+                if let Some(f) = anim.frame_at(t, ANIM_FPS, false) {
+                    skin.strum.draw_centered(gfx, f, lane_x(cx) + receptor_dx, receptor_cy, skin.strum_scale, [1.0, 1.0, 1.0, sa]);
                 }
             }
 
@@ -925,31 +989,28 @@ impl PlayScene {
                 let lane = n.direction.index();
                 let Some(cx) = xs[side][lane] else { continue };
                 let dist = |t: f64| ((t - pos) as f32) * px_per_ms;
-                let missed = n.has_missed;
-                let alpha = if missed { 0.3 } else { 1.0 };
 
                 if let Some(h) = &n.hold {
-                    if h.alive {
+                    // A dropped hold is hidden completely (`holdNote.alpha = 0`).
+                    let dropped = h.hit_note && h.missed_note;
+                    if h.alive && !dropped {
                         let end_t = n.strum_time() + h.full_sustain_length;
-                        let near = if h.hit_note && !h.missed_note { dist(n.strum_time()).max(0.0) } else { dist(n.strum_time()) };
+                        let near = if h.hit_note { dist(n.strum_time()).max(0.0) } else { dist(n.strum_time()) };
                         let far = dist(end_t);
                         if far > near {
-                            let a = if h.missed_note { 0.3 } else { 1.0 };
-                            draw_hold(gfx, skin, lane, cx, strum_cy + sign * near, far - near, sign, a * sa);
+                            // Strumline: y = strum.y - INITIAL_OFFSET + noteY + STRUMLINE_SIZE / 2
+                            // (the trail's near end), drawn at minus the style's offsets.
+                            let near_y = sy - RECEPTOR_INITIAL_OFFSET + sign * near + STRUMLINE_SIZE / 2.0 - skin.hold_off[1];
+                            let x = cx - skin.hold_off[0];
+                            draw_hold(gfx, skin, lane, x, near_y, far - near, sign, sa);
                         }
                     }
                 }
                 if !n.has_been_hit {
-                    let y = strum_cy + sign * dist(n.strum_time());
+                    // NoteSprite: centred on the lane minus NUDGE, top at strum.y - INITIAL_OFFSET + noteY.
+                    let y = sy - RECEPTOR_INITIAL_OFFSET + sign * dist(n.strum_time()) + skin.note_h[lane] / 2.0;
                     if y > -200.0 && y < VIEW_H + 200.0 {
-                        skin.notes.draw_centered(
-                            gfx,
-                            skin.note_frames[lane],
-                            cx,
-                            y,
-                            NOTE_SCALE,
-                            [1.0, 1.0, 1.0, alpha * sa],
-                        );
+                        skin.notes.draw_centered(gfx, skin.note_frames[lane], cx - NOTE_NUDGE, y, skin.note_scale, [1.0, 1.0, 1.0, sa]);
                     }
                 }
             }
@@ -969,16 +1030,12 @@ impl PlayScene {
                 };
                 let t = ((pos - c.since) / 1000.0) as f32;
                 let Some(f) = anim.frame_at(t, ANIM_FPS, looped) else { continue };
-                // Strumline.playNoteHoldCover, measured from the receptor centre:
-                // cover.x = strum.x + lane * 112 + 52 - cover.width / 2 - 12 and
-                // cover.y = strum.y + INITIAL_OFFSET + 52 - 96, while the receptor
-                // (232x236 frames at 0.7, placed at INITIAL_OFFSET on x only) is centred
-                // at (strum.x + lane * 112 + INITIAL_OFFSET + 81.2, strum.y + 82.6).
-                let (fw, fh) = (232.0 * NOTE_SCALE, 236.0 * NOTE_SCALE);
-                let w = atlas.frames[0].frame_w;
-                let dx = STRUMLINE_SIZE / 2.0 - w / 2.0 - 12.0 - (RECEPTOR_INITIAL_OFFSET + fw / 2.0);
-                let dy = RECEPTOR_INITIAL_OFFSET + STRUMLINE_SIZE / 2.0 - 96.0 - fh / 2.0;
-                atlas.draw(gfx, f, cx + dx, strum_cy + dy, 1.0, [1.0, 1.0, 1.0, side_alpha[side]]);
+                // Strumline.playNoteHoldCover (the cover's top-left).
+                let s = skin.cover_scale;
+                let w = atlas.frames[0].frame_w * s;
+                let x = lane_x(cx) + STRUMLINE_SIZE / 2.0 - w / 2.0 + skin.cover_off[0] * s - 12.0;
+                let y = sy + RECEPTOR_INITIAL_OFFSET + STRUMLINE_SIZE / 2.0 + skin.cover_off[1] * s - 96.0;
+                atlas.draw(gfx, f, x, y, s, [1.0, 1.0, 1.0, side_alpha[side]]);
             }
         }
 
@@ -1015,7 +1072,8 @@ impl PlayScene {
         for p in &self.popups {
             let a = p.alpha();
             if a > 0.0 {
-                gfx.sprite(p.tex, p.x, p.y, p.scale, [1.0, 1.0, 1.0, a]);
+                let (x, y) = if p.pixel { (p.x.round(), p.y.round()) } else { (p.x, p.y) };
+                gfx.sprite(p.tex, x, y, p.scale, [1.0, 1.0, 1.0, a]);
             }
         }
     }
@@ -1029,29 +1087,76 @@ impl PlayScene {
             return;
         }
         if let Some(t) = skin.countdown[i] {
+            // screenCenter() on the scaled sprite; pixel styles fade in 8 steps.
             let (w, h) = gfx.texture_size(t);
-            gfx.sprite(
-                t,
-                (1280.0 - w) / 2.0,
-                (720.0 - h) / 2.0,
-                1.0,
-                [1.0, 1.0, 1.0, 1.0 - cube_in_out(age as f32)],
-            );
+            let s = skin.countdown_scale;
+            let fade = if skin.countdown_pixel { stepped(age as f32, 8.0) } else { cube_in_out(age as f32) };
+            gfx.sprite(t, (VIEW_W - w * s) / 2.0, (VIEW_H - h * s) / 2.0, s, [1.0, 1.0, 1.0, 1.0 - fade]);
         }
+    }
+
+    /// Psych Engine's time bar (`timeBar` + `timeTxt`, "Time Left" mode): a
+    /// 400x19 bar filling white with the song's progress, with the time left in
+    /// VCR 32 over it. It fades in over 0.5 s (`circOut`) when the song starts.
+    fn draw_psych_time_bar(&self, gfx: &mut Gfx, vcr: Option<&TtfFont>) {
+        let pos = self.song_pos;
+        if pos < 0.0 || self.song_length_ms <= 0.0 {
+            return;
+        }
+        let t = (pos / 500.0).min(1.0) as f32;
+        let alpha = (1.0 - (t - 1.0) * (t - 1.0)).sqrt();
+        // timeTxt: x = STRUM_X + width / 2 - 248, y = 19 (height - 44 in downscroll).
+        let txt_y = if self.prefs.downscroll { VIEW_H - 44.0 } else { 19.0 };
+        let txt_h = vcr.map(|v| v.text_height(32.0, 1)).unwrap_or(40.0);
+        let (bw, bh) = (400.0, 19.0);
+        let bx = ((VIEW_W - bw) / 2.0).floor();
+        let by = (txt_y + txt_h / 4.0).floor();
+        let k = (pos / self.song_length_ms).clamp(0.0, 1.0) as f32;
+        let (ix, iy, iw, ih) = (bx + 3.0, by + 3.0, bw - 6.0, bh - 6.0);
+        gfx.rect(bx, by, bw, bh, [0.0, 0.0, 0.0, alpha]);
+        gfx.rect(ix, iy, (iw * k).round(), ih, [1.0, 1.0, 1.0, alpha]);
+        let Some(v) = vcr else { return };
+        // FlxStringUtil.formatTime(seconds left, false): "m:ss".
+        let left = ((self.song_length_ms - pos) / 1000.0).floor().max(0.0) as u64;
+        let text = format!("{}:{:02}", left / 60, left % 60);
+        let w = v.width(gfx, &text, 32.0);
+        let x = 42.0 + VIEW_W / 2.0 - 248.0 + (400.0 - w) / 2.0 - 2.0;
+        crate::menus::options::draw_outlined_alpha(gfx, v, &text, x, txt_y, 32.0, 2.0, alpha);
     }
 
     /// `healthBarBG`, `healthBar` (an `FlxBar`, RIGHT_TO_LEFT, 100 divisions),
     /// `scoreText` and the two health icons.
     fn draw_hud(&self, gfx: &mut Gfx, skin: &NoteSkin, font: &Font, vcr: Option<&TtfFont>) {
+        if self.prefs.psych_time_bar {
+            self.draw_psych_time_bar(gfx, vcr);
+        }
         let (bw, bh) = gfx.texture_size(skin.health_bar);
-        let by = if self.prefs.downscroll { 720.0 * 0.1 } else { 720.0 * 0.9 };
-        let bx = ((1280.0 - bw) / 2.0).floor();
-        gfx.sprite(skin.health_bar, bx, by, 1.0, WHITE);
-        let (ix, iy, iw, ih) = (bx + 4.0, by + 4.0, (bw - 8.0).floor(), (bh - 8.0).floor());
-        gfx.rect(ix, iy, iw, ih, [1.0, 0.0, 0.0, 1.0]);
         let frac = (self.health_lerp / HEALTH_MAX).clamp(0.0, 1.0) as f32;
-        let green = ((frac * 100.0).floor() * iw / 100.0).round();
-        gfx.rect(ix + iw - green, iy, green, ih, [0.4, 1.0, 0.2, 1.0]);
+        let (bx, by, ix, iy, iw) = if self.prefs.psych_health_bar {
+            // Psych Engine's `Bar`: 601x19 at 89% of the height (11% in downscroll),
+            // a 3 px black border, the opponent's colour on the left and the
+            // player's on the right, from the icons' dominant colours.
+            let (bw, bh): (f32, f32) = (601.0, 19.0);
+            let by: f32 = (if self.prefs.downscroll { 720.0f32 * 0.11 } else { 720.0f32 * 0.89 }).floor();
+            let bx = ((1280.0 - bw) / 2.0).floor();
+            let (ix, iy, iw, ih) = (bx + 3.0, by + 3.0, bw - 6.0, bh - 6.0);
+            gfx.rect(bx, by, bw, bh, [0.0, 0.0, 0.0, 1.0]);
+            let color = |i: usize| self.icons[i].as_ref().map(|c| c.color).unwrap_or([161.0 / 255.0; 3]);
+            let (p, o) = (color(0), color(1));
+            let left = (iw * (1.0 - frac)).round();
+            gfx.rect(ix, iy, left, ih, [o[0], o[1], o[2], 1.0]);
+            gfx.rect(ix + left, iy, iw - left, ih, [p[0], p[1], p[2], 1.0]);
+            (bx, by, ix, iy, iw)
+        } else {
+            let by = if self.prefs.downscroll { 720.0 * 0.1 } else { 720.0 * 0.9 };
+            let bx = ((1280.0 - bw) / 2.0).floor();
+            gfx.sprite(skin.health_bar, bx, by, 1.0, WHITE);
+            let (ix, iy, iw, ih) = (bx + 4.0, by + 4.0, (bw - 8.0).floor(), (bh - 8.0).floor());
+            gfx.rect(ix, iy, iw, ih, [1.0, 0.0, 0.0, 1.0]);
+            let green = ((frac * 100.0).floor() * iw / 100.0).round();
+            gfx.rect(ix + iw - green, iy, green, ih, [0.4, 1.0, 0.2, 1.0]);
+            (bx, by, ix, iy, iw)
+        };
 
         let score = if self.session.config.botplay {
             "Bot Play Enabled".to_owned()
@@ -1071,36 +1176,43 @@ impl PlayScene {
     }
 }
 
-/// Hold trail: the body column stretched from the head (`near_y`) for `len`
-/// pixels, then the end cap. `sign` is 1 for upscroll (trail goes down) and -1
-/// for downscroll (trail goes up, cap flipped).
-/// `NOTE_hold_assets.png` holds 8 columns: (body, end) for each direction.
+/// Port of `SustainTrail.updateClipping` + `draw`: a hold trail `len` px long
+/// from `near_y` (the end at the note), extending down (`sign` 1, upscroll) or
+/// up (-1, downscroll), centred on `cx`.
+///
+/// The graphic holds 8 columns, (body, end cap) per direction. The body tiles
+/// along the trail ending flush with the cap; the cap starts `endOffset` of the
+/// graphic's height before the trail's end and runs on to `bottomClip`. Pixel
+/// styles use `endOffset = bottomClip = 1`, the others 0.5 and 0.9.
 #[allow(clippy::too_many_arguments)]
 fn draw_hold(gfx: &mut Gfx, skin: &NoteSkin, lane: usize, cx: f32, near_y: f32, len: f32, sign: f32, alpha: f32) {
     let (tw, th) = gfx.texture_size(skin.hold);
+    let zoom = skin.hold_scale;
+    let (end_offset, bottom_clip) = if skin.hold_pixel { (1.0, 1.0) } else { (0.5, 0.9) };
     let col_w = tw / 8.0;
-    let w = col_w * NOTE_SCALE;
-    // The cap occupies the top ~64px of its column; the rest is padding.
-    let cap_full = (th * 0.735).floor();
-    let cap_h = (cap_full * NOTE_SCALE).min(len);
-    let body_len = len - cap_h;
-    let color = [1.0, 1.0, 1.0, alpha * 0.9];
+    let w = col_w * zoom;
+    let tile = th * zoom;
+    let color = [1.0, 1.0, 1.0, alpha];
     let (x0, x1) = (cx - w / 2.0, cx + w / 2.0);
-    // A segment from distance d0 to d1 along the trail; texture top at d0.
-    let seg = |d0: f32, d1: f32| {
+    let (u_body, u_cap) = (col_w * (lane * 2) as f32, col_w * (lane * 2 + 1) as f32);
+    // From distance d0 to d1 along the trail, showing texture rows v0..v1 (0..1).
+    let mut seg = |u: f32, d0: f32, d1: f32, v0: f32, v1: f32| {
         let (y0, y1) = (near_y + sign * d0, near_y + sign * d1);
-        [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+        gfx.quad(skin.hold, [u, v0 * th, col_w, (v1 - v0) * th], [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], color);
     };
-    if body_len > 0.0 {
-        gfx.quad(skin.hold, [col_w * (lane * 2) as f32, 0.0, col_w, th], seg(0.0, body_len), color);
+    let bottom_h = tile * end_offset;
+    let part = len - bottom_h;
+    if part > 0.0 {
+        // v = -(part - d) / tile with wrapping: whole tiles counted back from the cap.
+        let mut end = part;
+        while end > 0.0 {
+            let start = (end - tile).max(0.0);
+            seg(u_body, start, end, 1.0 - (end - start) / tile, 1.0);
+            end = start;
+        }
     }
-    let cap_src_h = cap_h / NOTE_SCALE;
-    gfx.quad(
-        skin.hold,
-        [col_w * (lane * 2 + 1) as f32, cap_full - cap_src_h, col_w, cap_src_h],
-        seg(body_len, len),
-        color,
-    );
+    let cap_v0 = if part > 0.0 { 0.0 } else { (bottom_h - len) / tile };
+    seg(u_cap, part.max(0.0), len + tile * (bottom_clip - end_offset), cap_v0, bottom_clip);
 }
 
 /// `FlxStringUtil.formatMoney(n, false, true)`: 1234567 -> "1,234,567".

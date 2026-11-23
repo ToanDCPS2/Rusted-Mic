@@ -33,9 +33,9 @@ charts with the original judgement, scoring, menus and options.
 
 ## How much is ported
 
-Roughly **45% of the player-facing game** is translated, judged by feature
+Roughly **50% of the player-facing game** is translated, judged by feature
 rather than line count. The original has about 122,000 lines of Haxe; this port
-is about 16,000 lines of Rust. The original's editors (chart editor, animation
+is about 18,000 lines of Rust. The original's editors (chart editor, animation
 editor and others, ~29,000 lines), mobile code, mod scripting and the Newgrounds
 integration are out of scope and count as 0%.
 
@@ -43,40 +43,36 @@ integration are out of scope and count as 0%.
 |---|---|---|
 | Chart loading, conductor, BPM / time-signature changes | ~95% | All 2.x song data, variations and difficulties |
 | Judgement, scoring, health, combo, ranks | ~95% | PBOT1 curve and hit windows, hold bonuses and drop penalties |
-| Notes, holds, strumlines | ~70% | No note splashes or pixel note style; layout is a few pixels off (see below) |
+| Notes, holds, strumlines, note styles (incl. pixel) | ~85% | No note splashes |
 | HUD: health bar, icons, score, popups, countdown | ~80% | |
-| Stages and characters | ~60% | Drawn and animated, including Animate atlases; stage and character scripts are not ported |
+| Stages and characters | ~60% | Drawn and animated, including Animate atlases and Weekend 1's rain shader; most stage and character scripts are not ported |
 | Song events (camera focus, zoom, bops, animations) | ~70% | |
 | Pause menu | ~85% | Resume, restart, change difficulty, practice mode, offset hotkeys |
-| Options (preferences, controls, lag adjustment, clear save) | ~90% | Plus Middlescroll and Hide Opponent Notes. No gamepads. |
-| Title screen, main menu | ~85% | |
+| Options (preferences, controls, lag adjustment, clear save) | ~90% | Plus Middlescroll, Hide Opponent Notes, Ghost Tapping and Psych Engine's time bar and health bar (all off by default). No gamepads. |
+| Title screen, main menu | ~90% | Merch opens the store page |
 | Freeplay | ~40% | Song list, difficulties, previews and DJ; no album art, letter sort, favourites or saved scores |
 | Transitions (fade, sticker transition) | ~70% | |
-| Game over screen | ~20% | Placeholder screen, Tankman's death quotes |
+| Game over screen | ~80% | Death animations, camera, music, retry and Tankman's quotes; Pico's can explosion death (2hot) and the 1-in-4096 fakeout are not ported |
 | Results screen | ~5% | Placeholder with the tallies and rank |
-| Story mode, character select, credits | 0% | |
+| Credits | ~70% | Reads `data/credits.json` if present; the base game builds its credits into the exe, so only the founders are listed otherwise |
+| Story mode, character select | 0% | |
 | Dialogue, cutscenes, videos | 0% | |
 | Sound tray, debug display, screenshots, Discord presence | ~80% | |
 
 ## Known issues
 
-- **Pixel weeks (Week 6)** use the normal note skin, popups and countdown
-  instead of the pixel ones.
-- **Strumline position:** a recent audit found the arrows drawn about 28 px
-  closer to the screen edge than the original (in both up- and downscroll), and
-  notes, holds and hold covers off by a few pixels. Hold trails approximate the
-  original's end-cap maths.
 - **Scripted behaviour is missing:** Nene's knife states, the limo dancers,
   Philly's train and window lights, Week 7's Tankmen and similar stage effects.
   Dialogue (Week 6), cutscenes and videos are not played.
 - **Not ported:** note splashes, gamepad support, story mode, character select,
-  the real results and game over screens, freeplay album art, letter sort,
+  the real results screen, freeplay album art, letter sort,
   favourites and saved scores, `packer` atlases, note-kind scripts and GF's
   combo-drop animations.
-- **Recently added and only lightly tested:** the sticker transition when leaving
+- **Recently added and only lightly tested:** note styles (Week 6's pixel
+  arrows) and the strumline/note/hold placement, the sticker transition when leaving
   a song, health icons, the rating and combo popups, the fix for notes freezing
-  at the start of a second song, and Daddy Dearest / Mommy Mearest idle
-  animations.
+  at the start of a second song, Daddy Dearest / Mommy Mearest idle
+  animations, the Weekend 1 rain, the credits and the game over screens.
 - The pause music keeps playing when the window loses focus.
 - Animated (XML) health icons and mid-song icon changes are not supported.
 - The score text uses the VCR TrueType font. The newest upstream code uses a
@@ -153,9 +149,11 @@ RustedMic logo --square icon.png      # 1024x1024 logo for Discord's Rich Presen
 ### Settings
 
 Options (main menu → Options) has Preferences, Controls, Lag Adjustment and
-Clear Save Data, as in the original, plus two new preferences: **Middlescroll**
-(your strumline centred, the opponent's split to the sides) and **Hide Opponent
-Notes**. Everything is saved to `%LOCALAPPDATA%\Rusted Mic\settings.json`.
+Clear Save Data, as in the original, plus new preferences: **Middlescroll**
+(your strumline centred, the opponent's split to the sides), **Hide Opponent
+Notes**, **Ghost Tapping** (key presses with no note aren't penalized), and
+Psych Engine's **time bar** (which also moves the arrows to Psych's position)
+and **health bar** (in the characters' colours). All of these are off by default. Everything is saved to `%LOCALAPPDATA%\Rusted Mic\settings.json`.
 
 Default hotkeys (all rebindable): F11 fullscreen, F3 screenshot (saved to
 `screenshots\` next to the exe; click the preview to open the folder), `-`/`=`/`0`
@@ -196,7 +194,7 @@ not compiled at all, and you pass `--assets <game>\assets` yourself.
 
 Ported faithfully: PBOT1 scoring curve and windows, health values, combo rules,
 hold note bonus and drop penalties, ghost-miss penalties (ghost tapping is
-**off**, matching desktop builds), rank thresholds, time-change math, and voice
+**off** by default, matching desktop builds), rank thresholds, time-change math, and voice
 file resolution, including its quirks.
 
 Deliberate differences, all aimed at determinism (see `play/mod.rs`):

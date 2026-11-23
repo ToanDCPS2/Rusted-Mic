@@ -4,6 +4,7 @@
 
 mod album_roll;
 mod bf_card;
+pub mod credits;
 pub mod freeplay;
 pub mod main_menu;
 pub mod options;
@@ -57,6 +58,11 @@ pub enum MenuAction {
     OpenOptionsNow,
     /// Fade out of options back to the main menu.
     CloseOptions,
+    /// Fade out, then open the credits.
+    OpenCredits,
+    OpenCreditsNow,
+    /// Fade out of the credits back to the main menu.
+    CloseCredits,
     /// Save data was cleared: restart from the title (`InitState`).
     Restart,
     Play(funkin_core::state::PlayRequest),

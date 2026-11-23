@@ -95,8 +95,30 @@ pub struct CharacterData {
     pub starting_animation: Option<String>,
     #[serde(default)]
     pub animations: Vec<AnimationData>,
+    /// Game over camera settings (`CharacterDeathData`).
+    #[serde(default)]
+    pub death: Option<DeathData>,
     #[serde(skip)]
     pub id: String,
+}
+
+/// Port of `CharacterDeathData`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeathData {
+    #[serde(default)]
+    pub camera_offsets: [f64; 2],
+    #[serde(default = "one")]
+    pub camera_zoom: f64,
+    /// Seconds between the death and the game over screen.
+    #[serde(default)]
+    pub pre_transition_delay: f64,
+}
+
+impl Default for DeathData {
+    fn default() -> Self {
+        Self { camera_offsets: [0.0, 0.0], camera_zoom: 1.0, pre_transition_delay: 0.0 }
+    }
 }
 
 /// A character slot on a stage.

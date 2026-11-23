@@ -253,6 +253,24 @@ impl Actor {
         self.by_name.contains_key(name)
     }
 
+    /// The current animation's frame number (`curAnim.curFrame`).
+    pub fn frame_number(&self) -> usize {
+        match self.cur {
+            None => 0,
+            Some(i) => {
+                let d = &self.anims[i];
+                let n = d.seq.len().max(1);
+                let f = (self.time.max(0.0) * d.fps) as usize;
+                if d.looped { f % n } else { f.min(n - 1) }
+            }
+        }
+    }
+
+    /// The current animation's frame count (`curAnim.numFrames`).
+    pub fn frame_count(&self) -> usize {
+        self.cur.map(|i| self.anims[i].seq.len()).unwrap_or(0)
+    }
+
     pub fn current(&self) -> &str {
         self.cur.map(|i| self.anims[i].name.as_str()).unwrap_or("")
     }

@@ -19,6 +19,7 @@ use crate::gfx::ttf::TtfFont;
 use crate::gfx::{Gfx, WHITE};
 use crate::menus::freeplay::{list_songs, Freeplay, FreeplaySong};
 use crate::menus::main_menu::MainMenu;
+use crate::menus::credits::Credits;
 use crate::menus::options::Options;
 use crate::menus::title::Title;
 use crate::menus::{Fonts, MenuAction, Music};
@@ -56,7 +57,10 @@ struct Loaded {
     gradient: crate::gfx::TexId,
     gfx: Gfx,
     fonts: Fonts,
+    /// The default (`funkin`) note style, also used by the options menu.
     skin: NoteSkin,
+    /// Other note styles, loaded the first time a song uses them.
+    skins: std::collections::HashMap<String, NoteSkin>,
     tray: SoundTray,
     shots: Screenshots,
     debug: DebugOverlay,
@@ -74,6 +78,8 @@ pub struct App {
     freeplay: Option<Freeplay>,
     /// The options menu, open over the main menu state.
     options: Option<Options>,
+    /// The credits scroll, open over the main menu state.
+    credits: Option<Credits>,
     /// Freeplay's selection, kept across songs.
     remembered: Option<(String, String)>,
     play: Option<PlayScene>,
@@ -145,6 +151,7 @@ pub fn run(
         main_menu: None,
         freeplay: None,
         options: None,
+        credits: None,
         remembered: None,
         play: None,
         pause: None,
@@ -188,12 +195,19 @@ fn load_game(mut gfx: Gfx, assets: &Assets) -> Result<Loaded, String> {
         five_by_seven: assets.ttf_path("5by7.ttf").and_then(|p| TtfFont::load(&p).map_err(|e| log::warn!("{e}")).ok()),
         five_by_seven_bold: assets.ttf_path("5by7_Bold.ttf").and_then(|p| TtfFont::load(&p).map_err(|e| log::warn!("{e}")).ok()),
     };
-    let skin = NoteSkin::load(&mut gfx, assets)?;
+    let skin = NoteSkin::load(&mut gfx, assets, "funkin")?;
     let ramp: Vec<u8> = (0..256u32).flat_map(|i| [0, 0, 0, i as u8]).collect();
     let gradient = gfx.upload_rgba(1, 256, &ramp);
     let tray = SoundTray::new(&mut gfx, assets);
     let shots = Screenshots::new(assets);
-    Ok(Loaded { gradient, gfx, fonts, skin, tray, shots, debug: DebugOverlay::new() })
+    Ok(Loaded { gradient, gfx, fonts, skin, skins: Default::default(), tray, shots, debug: DebugOverlay::new() })
+}
+
+impl Loaded {
+    /// The note skin for a style id (the default one if it isn't loaded).
+    fn skin_for(&self, id: &str) -> &NoteSkin {
+        if id == self.skin.id { &self.skin } else { self.skins.get(id).unwrap_or(&self.skin) }
+    }
 }
 
 impl App {
@@ -273,6 +287,9 @@ impl App {
             downscroll: s.downscroll,
             middlescroll: s.middlescroll,
             hide_opponent: s.hide_opponent_notes,
+            ghost_tapping: s.ghost_tapping,
+            psych_time_bar: s.psych_time_bar,
+            psych_health_bar: s.psych_health_bar,
             strumline_bg: s.strumline_background as f32 / 100.0,
             zoom_camera: s.zoom_camera,
             subtitles: s.subtitles,
@@ -303,6 +320,16 @@ impl App {
             Ok(scene) => {
                 l.gfx.window().set_title(&format!("Rusted Mic - {}", scene.title));
                 self.sticker_pack = resolve_pack(&self.assets, scene.sticker_pack.as_deref(), &scene.player);
+                // Load the song's note style once (outside the song's texture scope, so it stays).
+                let style = scene.note_style.clone();
+                if style != l.skin.id && !l.skins.contains_key(&style) {
+                    match NoteSkin::load(&mut l.gfx, &self.assets, &style) {
+                        Ok(s) => {
+                            l.skins.insert(style, s);
+                        }
+                        Err(e) => log::warn!("note style {style}: {e}"),
+                    }
+                }
                 self.play = Some(scene);
                 self.freeplay = None;
                 self.play_started = unix_now();
@@ -361,21 +388,6 @@ impl App {
             scene.practice(),
             self.settings.global_offset,
         ));
-    }
-
-    /// The game-over quote (`bf.getDeathQuote`): Tankman taunts you, censored
-    /// unless Naughtyness is on.
-    fn death_quote(&self, opponent: &str, variation: &str) {
-        if !opponent.starts_with("tankman") {
-            return;
-        }
-        let censored: &[u32] = if self.settings.naughtyness { &[] } else { &[1, 3, 8, 13, 17, 21] };
-        let pool: Vec<u32> = (1..=25).filter(|n| !censored.contains(n)).collect();
-        let n = pool[((crate::menus::random() * pool.len() as f32) as usize).min(pool.len() - 1)];
-        let dir = if variation == "pico" { "jeffGameover-pico" } else { "jeffGameover" };
-        if let Some(s) = self.assets.sound(&format!("week7:{dir}/jeffGameover-{n}")) {
-            self.audio.play_sfx(s, 1.0);
-        }
     }
 
     fn open_title(&mut self, skip_intro: bool) {
@@ -488,6 +500,22 @@ impl App {
                 }
                 self.fade = Some(Fade::In { start: self.clock });
             }
+            MenuAction::OpenCredits => {
+                if !matches!(self.fade, Some(Fade::Out { .. })) {
+                    self.fade = Some(Fade::Out { start: self.clock, then: MenuAction::OpenCreditsNow });
+                }
+            }
+            MenuAction::OpenCreditsNow => {
+                let Some(l) = self.loaded.as_mut() else { return };
+                self.credits = Some(Credits::new(&mut l.gfx, &self.assets, l.fonts.vcr.as_ref()));
+                Credits::start_music(&self.audio, &self.assets, &mut self.music);
+                self.fade = Some(Fade::In { start: self.clock });
+            }
+            MenuAction::CloseCredits => {
+                if !matches!(self.fade, Some(Fade::Out { .. })) {
+                    self.fade = Some(Fade::Out { start: self.clock, then: MenuAction::ToMainMenu });
+                }
+            }
             MenuAction::CloseOptions => {
                 if !matches!(self.fade, Some(Fade::Out { .. })) {
                     self.fade = Some(Fade::Out { start: self.clock, then: MenuAction::ToMainMenu });
@@ -529,9 +557,7 @@ impl App {
         self.deaths = 0;
         match exit {
             StickerExit::Pause => self.leave_play(Transition::Back),
-            StickerExit::GameOver => {
-                self.state.apply(Transition::Back);
-            }
+            StickerExit::GameOver => self.leave_play(Transition::Back),
             StickerExit::Results => {
                 self.state.apply(Transition::Confirm);
             }
@@ -611,6 +637,10 @@ impl App {
             if let Some(p) = &mut self.pause {
                 p.key_up(menu, self.shift);
             }
+            if let Some(c) = &mut self.credits {
+                let is_pause = self.settings.controls.is(Control::Pause, code);
+                c.key(code, menu, is_pause, false);
+            }
             if let Some(o) = &mut self.options {
                 o.key_up(code, menu, &mut self.settings, &self.audio);
                 if std::mem::take(&mut o.dirty) {
@@ -678,6 +708,12 @@ impl App {
             return;
         }
 
+        if let Some(c) = &mut self.credits {
+            let is_pause = self.settings.controls.is(Control::Pause, code);
+            let a = c.key(code, menu, is_pause, true);
+            self.act(a);
+            return;
+        }
         if let Some(o) = &mut self.options {
             let a = o.key_down(code, menu, ev.repeat, &mut self.settings, &self.audio, &mut self.music, &self.assets);
             if std::mem::take(&mut o.dirty) {
@@ -702,13 +738,21 @@ impl App {
                 None => MenuAction::None,
             },
             GameState::GameOver(req) => {
-                match code {
-                    KeyCode::Enter => {
-                        let req = req.clone();
+                let req = req.clone();
+                let scene = self.play.as_mut().filter(|s| s.has_death());
+                match (code, scene) {
+                    (KeyCode::Enter, Some(scene)) => scene.death_confirm(&self.audio, &self.assets),
+                    (KeyCode::Enter, None) => {
                         self.state.apply(Transition::Retry);
                         self.start_song(req, false);
                     }
-                    KeyCode::Escape => self.exit_with_stickers(StickerExit::GameOver),
+                    (KeyCode::Escape, Some(scene)) => {
+                        if scene.death_can_go_back() {
+                            scene.death_stop(&self.audio);
+                            self.exit_with_stickers(StickerExit::GameOver);
+                        }
+                    }
+                    (KeyCode::Escape, None) => self.exit_with_stickers(StickerExit::GameOver),
                     _ => {}
                 }
                 MenuAction::None
@@ -738,6 +782,7 @@ impl App {
             (GameState::GameOver(req), _) => Presence { details: "Game Over".into(), state: Some(req.song_id.replace('-', " ")), start: None },
             (GameState::Freeplay, _) => Presence { details: "In the Menus".into(), state: Some("Freeplay".into()), start: None },
             _ if self.options.is_some() => Presence { details: "In the Menus".into(), state: Some("Options".into()), start: None },
+            _ if self.credits.is_some() => Presence { details: "In the Menus".into(), state: Some("Credits".into()), start: None },
             _ => Presence { details: "In the Menus".into(), state: None, start: None },
         };
         self.discord.set(Some(p));
@@ -755,14 +800,30 @@ impl App {
 
         // Gameplay update first, so input → judgement → draw happens in one frame.
         if let (GameState::Play(_), Some(scene), None, false) = (&self.state, self.play.as_mut(), &self.pause, frozen) {
-            let skin = &self.loaded.as_ref().unwrap().skin;
+            let skin = self.loaded.as_ref().unwrap().skin_for(&scene.note_style);
             match scene.update(&self.audio, skin) {
                 PlayOutcome::Running => {}
                 PlayOutcome::Died => {
-                    let (opp, var) = (scene.opponent.clone(), scene.request.variation.clone());
+                    // PlayState: the song stops and GameOverSubState opens over the stage.
                     self.deaths += 1;
-                    self.leave_play(Transition::Died);
-                    self.death_quote(&opp, &var);
+                    self.close_pause();
+                    self.audio.set_paused(false);
+                    self.audio.stop();
+                    self.state.apply(Transition::Died);
+                    let naughty = self.settings.naughtyness;
+                    let shown = match (self.play.as_mut(), self.loaded.as_mut()) {
+                        (Some(scene), Some(l)) => scene.start_death(&mut l.gfx, &self.assets, naughty),
+                        _ => false,
+                    };
+                    if !shown {
+                        // No stage to die on: the plain game over screen.
+                        if let (Some(scene), Some(l)) = (self.play.take(), self.loaded.as_mut()) {
+                            l.gfx.release_textures(scene.tex_mark);
+                        }
+                    }
+                    if let Some(l) = &self.loaded {
+                        l.gfx.window().set_title("Rusted Mic");
+                    }
                 }
                 PlayOutcome::Finished => {
                     let s = &scene.session;
@@ -777,6 +838,17 @@ impl App {
                         // Story playlists continue automatically.
                         self.start_song(next, false);
                     }
+                }
+            }
+        }
+        // The game over screen.
+        if let (GameState::GameOver(req), Some(scene), false) = (&self.state, self.play.as_mut(), frozen) {
+            if let crate::game_over::DeathAction::Retry { pixel } = scene.death_update(dt, &self.audio, &self.assets) {
+                let (req, practice) = (req.clone(), scene.practice());
+                self.state.apply(Transition::Retry);
+                self.start_song(req, practice);
+                if let Some(s) = self.play.as_mut() {
+                    s.fade_in(pixel);
                 }
             }
         }
@@ -809,9 +881,10 @@ impl App {
             Some(Fade::In { start }) if self.clock - start >= FADE_IN_SECS => self.fade = None,
             Some(Fade::Out { start, then }) if self.clock - start >= FADE_OUT_SECS => {
                 self.fade = None;
-                if matches!(then, MenuAction::ToMainMenu) && self.options.is_some() {
-                    // Leaving options: the main menu comes back interactive.
+                if matches!(then, MenuAction::ToMainMenu) && (self.options.is_some() || self.credits.is_some()) {
+                    // Leaving options or credits: the main menu comes back interactive.
                     self.options = None;
+                    self.credits = None;
                     if let Some(m) = &mut self.main_menu {
                         m.uncover();
                     }
@@ -839,6 +912,8 @@ impl App {
                 self.settings_changed();
             }
             Some(a)
+        } else if let Some(c) = &mut self.credits {
+            Some(c.update(dt, self.shift))
         } else {
             match &self.state {
                 GameState::Title => self.title.as_mut().map(|t| t.update(dt, music_ms)),
@@ -867,11 +942,14 @@ impl App {
         let font = &fonts.bold;
         if let Some(o) = &self.options {
             o.draw(gfx, fonts, &l.skin, &self.settings);
+        } else if let Some(c) = &self.credits {
+            c.draw(gfx, fonts.vcr.as_ref());
         } else {
             match &self.state {
                 GameState::Play(_) => {
                     if let Some(scene) = &self.play {
-                        scene.draw(gfx, &l.skin, font, fonts.vcr.as_ref());
+                        let skin = if scene.note_style == l.skin.id { &l.skin } else { l.skins.get(&scene.note_style).unwrap_or(&l.skin) };
+                        scene.draw(gfx, skin, font, fonts.vcr.as_ref());
                         scene.draw_subtitles(gfx, fonts.vcr.as_ref());
                     }
                     if let Some(p) = &self.pause {
@@ -889,6 +967,11 @@ impl App {
                     }
                     if let (GameState::Freeplay, Some(f)) = (&self.state, &self.freeplay) {
                         f.draw(gfx, fonts);
+                    }
+                }
+                GameState::GameOver(_) if self.play.as_ref().is_some_and(|s| s.has_death()) => {
+                    if let Some(scene) = &self.play {
+                        scene.draw_death(gfx);
                     }
                 }
                 GameState::GameOver(req) => {

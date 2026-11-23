@@ -14,6 +14,25 @@ use super::{anim, flicker_visible, follow_lerp, screen_camera, MenuAction, Tween
 
 const ITEMS: [&str; 5] = ["storymode", "freeplay", "merch", "options", "credits"];
 const SPACING: f32 = 160.0;
+/// `Constants.URL_MERCH_FALLBACK` (the Newgrounds referral isn't available).
+const URL_MERCH: &str = "https://needlejuicerecords.com/en-ca/pages/friday-night-funkin";
+
+/// `WindowUtil.openURL`: open a link in the default browser.
+pub fn open_url(url: &str) {
+    #[cfg(windows)]
+    let r = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).creation_flags(CREATE_NO_WINDOW).spawn()
+    };
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = r {
+        log::warn!("open {url}: {e}");
+    }
+}
 
 pub struct MainMenu {
     bg: Actor,
@@ -130,10 +149,10 @@ impl MainMenu {
                 sfx(&self.scroll_sfx, 0.4);
             }
             KeyCode::Enter | KeyCode::Space => {
-                if matches!(ITEMS[self.selected], "freeplay" | "options") {
+                if matches!(ITEMS[self.selected], "freeplay" | "options" | "merch" | "credits") {
                     sfx(&self.confirm_sfx, 1.0);
                     self.accepted_at = Some(self.time);
-                    if ITEMS[self.selected] == "options" {
+                    if matches!(ITEMS[self.selected], "options" | "credits") {
                         // startExitState: the other items fade out.
                         for (i, f) in self.fades.iter_mut().enumerate() {
                             if i != self.selected {
@@ -142,7 +161,7 @@ impl MainMenu {
                         }
                     }
                 } else {
-                    // Story mode, merch and credits aren't ported yet.
+                    // Story mode isn't ported yet.
                     sfx(&self.cancel_sfx, 1.0);
                 }
             }
@@ -166,9 +185,20 @@ impl MainMenu {
             // FlxFlicker.flicker(magenta, 1.1, 0.15, false, true)
             self.magenta.visible = self.flashing_lights && e < 1.1 && flicker_visible(e, 0.15);
             if e >= 1.0 && !self.covered {
+                if ITEMS[self.selected] == "merch" {
+                    // selectMerch: open the store, then back to idle.
+                    open_url(URL_MERCH);
+                    self.accepted_at = None;
+                    self.magenta.visible = false;
+                    return MenuAction::None;
+                }
                 self.covered = true;
                 self.magenta.visible = false;
-                return if ITEMS[self.selected] == "options" { MenuAction::OpenOptions } else { MenuAction::OpenFreeplay };
+                return match ITEMS[self.selected] {
+                    "options" => MenuAction::OpenOptions,
+                    "credits" => MenuAction::OpenCredits,
+                    _ => MenuAction::OpenFreeplay,
+                };
             }
         }
         MenuAction::None

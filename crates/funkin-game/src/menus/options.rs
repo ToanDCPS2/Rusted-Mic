@@ -1,6 +1,6 @@
 //! Port of `OptionsState` and its pages: the options list, `PreferencesMenu`
-//! (every desktop preference, plus Rusted Mic's Middlescroll and Hide
-//! Opponent Notes), `ControlsMenu` (key rebinding), `OffsetMenu` (lag
+//! (every desktop preference, plus Rusted Mic's Middlescroll, Hide
+//! Opponent Notes and Ghost Tapping), `ControlsMenu` (key rebinding), `OffsetMenu` (lag
 //! adjustment: global offset, calibration and a test strumline) and the
 //! clear-save-data prompt.
 
@@ -64,6 +64,9 @@ fn prefs() -> Vec<Pref> {
         Pref { name: "Downscroll", desc: "When enabled, notes move downwards toward the strumline at the bottom of the screen.", kind: Check(|s| s.downscroll, |s, v| s.downscroll = v) },
         Pref { name: "Middlescroll", desc: "When enabled, your notes are centered and the opponent's notes move to the sides.", kind: Check(|s| s.middlescroll, |s, v| s.middlescroll = v) },
         Pref { name: "Hide Opponent Notes", desc: "When enabled, the opponent's strumline and notes are hidden.", kind: Check(|s| s.hide_opponent_notes, |s, v| s.hide_opponent_notes = v) },
+        Pref { name: "Ghost Tapping", desc: "When enabled, pressing a key with no note to hit doesn't count as a miss.", kind: Check(|s| s.ghost_tapping, |s, v| s.ghost_tapping = v) },
+        Pref { name: "Psych Engine Time Bar", desc: "When enabled, a bar at the top of the screen shows how much of the song is left, like in Psych Engine.", kind: Check(|s| s.psych_time_bar, |s, v| s.psych_time_bar = v) },
+        Pref { name: "Psych Engine Health Bar", desc: "When enabled, the health bar uses the characters' colours, like in Psych Engine.", kind: Check(|s| s.psych_health_bar, |s, v| s.psych_health_bar = v) },
         Pref { name: "Strumline Background", desc: "Show a semi-transparent background behind the strumline.", kind: Num { get: |s| s.strumline_background, set: |s, v| s.strumline_background = v, min: 0, max: 100, step: 10, pct: true } },
         Pref { name: "Flashing Lights", desc: "When disabled, flashing effects are dampened. Useful for people with photosensitive epilepsy.", kind: Check(|s| s.flashing_lights, |s, v| s.flashing_lights = v) },
         Pref { name: "Camera Zooms", desc: "When enabled, the camera bounces during songs.", kind: Check(|s| s.zoom_camera, |s, v| s.zoom_camera = v) },
