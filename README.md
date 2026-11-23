@@ -1,6 +1,6 @@
 # Rusted Mic
 
-A personal, unofficial Rust port of [Friday Night Funkin'](https://github.com/FunkinCrew/Funkin)
+An unofficial Rust port of [Friday Night Funkin'](https://github.com/FunkinCrew/Funkin)
 by The Funkin' Crew, translated from the game's open-source Haxe code (Apache-2.0).
 It is a native Windows program (wgpu + cpal) that plays the real game's songs and
 charts with the original judgement, scoring, menus and options.
