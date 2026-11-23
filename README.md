@@ -8,7 +8,7 @@ charts with the original judgement, scoring, menus and options.
 > **You need your own copy of Friday Night Funkin'.** This repository and its
 > releases contain **no game assets**: no art, music, sounds, charts, fonts or
 > videos. On first launch Rusted Mic asks for the folder of your installation
-> (Steam, itch.io or a self-built copy, version 0.8.x) and packs its `assets`
+> (itch.io or a self-built copy, version 0.8.x) and packs its `assets`
 > folder into `assets.pak` next to the executable. Without it the game will not
 > start. Get the game on Steam or
 > [itch.io](https://ninja-muffin24.itch.io/funkin), or build it from the
