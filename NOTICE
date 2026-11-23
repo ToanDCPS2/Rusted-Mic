@@ -1,0 +1,13 @@
+funkin-rs
+Personal Rust port of game logic from Friday Night Funkin'.
+
+This product includes software derived from Friday Night Funkin'
+(https://github.com/FunkinCrew/Funkin), Copyright 2020-2024 The Funkin' Crew Inc.,
+licensed under the Apache License, Version 2.0. Ported from upstream commit
+94ee0f2a9386d80e445be39ee2ed4b4a630cfbac.
+
+Modifications: translated from Haxe to Rust; rendering, audio and scripting
+removed from the logic layer; input timing made timestamp-based.
+
+"Friday Night Funkin'" and its logo are trademarks of The Funkin' Crew Inc.
+No game assets (art, music, sound effects, charts) are included in this project.

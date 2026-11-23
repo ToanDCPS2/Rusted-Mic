@@ -1,0 +1,19 @@
+[package]
+name = "funkin-assets"
+description = "First-boot detection, validation and import of a user-supplied Funkin' installation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+funkin-core = { path = "../funkin-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+log.workspace = true
+zstd.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

@@ -1,0 +1,7 @@
+/target
+# Never commit game assets.
+/assets
+*.ogg
+*.png
+*.pak
+*.pak.tmp
