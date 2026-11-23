@@ -211,5 +211,5 @@ See *Known issues* above for what is not yet ported.
 
 The code is a derivative of Funkin' source code, used under the Apache License
 2.0 (see `LICENSE-APACHE` and `NOTICE`). "Friday Night Funkin'" is a trademark of
-The Funkin' Crew Inc. This project is unaffiliated and for personal use. The game's
-assets are under a separate license and are never redistributed by this project.
+The Funkin' Crew Inc. This project is unaffiliated. The game's assets are under a
+separate license and are never redistributed by this project.
