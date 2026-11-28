@@ -84,6 +84,8 @@ const K_RECEPTOR: u32 = 41;
 const K_VBITMAP: u32 = 45;
 /// A character's `cameraFocusPoint` (id: the character's sprite id).
 const K_CFOCUS: u32 = 46;
+/// A character's `originalPosition` (id = the character's sprite id).
+const K_ORIGPOS: u32 = 47;
 /// A `NoteSprite`: `side << 32 | note index`.
 const K_NOTE: u32 = 42;
 /// A note's `holdNoteSprite` (`SustainTrail`), same id as the note.
@@ -296,13 +298,16 @@ pub struct HudElem {
     /// `animation.play(name)` on an icon: "idle", "losing", "winning".
     pub anim: Option<String>,
     pub z: Option<i32>,
+    /// HealthIcon `bopEvery` / `bopAngle`.
+    pub bop_every: i64,
+    pub bop_angle: f32,
     /// The last drawn rectangle (x, y, w, h).
     pub rect: std::cell::Cell<[f32; 4]>,
 }
 
 impl Default for HudElem {
     fn default() -> Self {
-        Self { visible: true, alpha: 1.0, pos: [None; 2], flip: None, auto_update: true, anim: None, z: None, rect: Default::default() }
+        Self { visible: true, alpha: 1.0, pos: [None; 2], flip: None, auto_update: true, anim: None, z: None, bop_every: 4, bop_angle: 0.0, rect: Default::default() }
     }
 }
 
@@ -1093,6 +1098,35 @@ impl Scripts {
         handled
     }
 
+    /// What the level's scripts (its stage, song and characters, and the
+    /// modules in play) take over of the HUD, read from their source before
+    /// any of their events run. See [`crate::hud_scan`].
+    pub fn hud_takeover(&self) -> crate::hud_scan::HudTakeover {
+        let mut out = crate::hud_scan::HudTakeover::default();
+        let mut seen: HashSet<Rc<str>> = HashSet::new();
+        for b in &self.state.bound {
+            let Value::Instance(inst) = b else { continue };
+            let module = inst.class.host_base.borrow().as_deref() == Some("Module");
+            // The class and its scripted ancestors.
+            let mut cls = Some(inst.class.clone());
+            while let Some(c) = cls {
+                let file = c.decl.file.clone();
+                if seen.insert(file.clone()) {
+                    if let Ok(src) = funkin_core::vfs::read_to_string(std::path::Path::new(&*file)) {
+                        let t = crate::hud_scan::scan(&src, module, &self.state.song_id);
+                        if t.any() {
+                            log::info!("{} takes over the HUD: {t:?}", c.decl.name);
+                        }
+                        out.health_bar |= t.health_bar;
+                        out.strumlines |= t.strumlines;
+                    }
+                }
+                cls = c.parent.borrow().clone();
+            }
+        }
+        out
+    }
+
     /// The stage's `buildStage` (the props are already built natively; this runs the script's additions).
     pub fn create(&mut self, gfx: &mut Gfx, world: Option<&mut World>, audio: &Audio) {
         let mut world = world;
@@ -1136,6 +1170,16 @@ impl Scripts {
                     let key = format!("{}.addCharacter", inst.class.decl.name);
                     if failed.insert(key.clone()) {
                         log::warn!("script {key}: {e}");
+                    }
+                }
+            }
+            // Stage.addCharacter ends with `ScriptEvent(ADDED)` to the character itself.
+            if let Some(cs) = ctx.char_script(CHAR | slot) {
+                if matches!(&cs, Value::Instance(i) if i.class.has_method("onAdd")) {
+                    if let Err(e) = interp.call_method(&mut ctx, &cs, "onAdd", vec![event(vec![])]) {
+                        if failed.insert(format!("onAdd:{e}")) {
+                            log::warn!("script onAdd: {e}");
+                        }
                     }
                 }
             }
@@ -2468,6 +2512,7 @@ impl Ctx<'_> {
             ("Scoring", "PBOT1_MISS_THRESHOLD") => Value::Float(160.0),
             ("PlayStatePlaylist", "isStoryMode") => Value::Bool(s.is_story),
             ("PlayStatePlaylist", "campaignDifficulty") => Value::str(&s.difficulty),
+            ("CountdownStep", s @ ("BEFORE" | "THREE" | "TWO" | "ONE" | "GO" | "AFTER")) => Value::str(s),
             ("CharacterType", "BF") => Value::str("bf"),
             ("CharacterType", "DAD") => Value::str("dad"),
             ("CharacterType", "GF") => Value::str("gf"),
@@ -2991,6 +3036,9 @@ impl Ctx<'_> {
             self.char_focus(id)?;
             return Some(Value::Host(HostRef { kind: K_CFOCUS, id }));
         }
+        if field == "originalPosition" && id & CHAR != 0 {
+            return Some(Value::Host(HostRef { kind: K_ORIGPOS, id }));
+        }
         if field == "debug" {
             return Some(Value::Bool(false));
         }
@@ -3508,6 +3556,18 @@ impl Ctx<'_> {
                 Value::Null
             }
             "isAnimationFinished" => Value::Bool(act.finished()),
+            "resetPosition" if id & CHAR != 0 => {
+                // Bopper.resetPosition; BaseCharacter's x/y setters move the camera focus along.
+                let slot = (id & 0xFF) as usize;
+                if let Some(c) = self.world.as_deref_mut().and_then(|w| w.chars[slot].as_mut()) {
+                    let [dx, dy] = [c.original[0] - c.actor.x, c.original[1] - c.actor.y];
+                    c.actor.x = c.original[0];
+                    c.actor.y = c.original[1];
+                    c.focus[0] += dx as f64;
+                    c.focus[1] += dy as f64;
+                }
+                Value::Null
+            }
             "dance" => {
                 let force = arg(a, 0).truthy();
                 if id & CHAR != 0 {
@@ -3663,6 +3723,20 @@ impl Ctx<'_> {
                     Some(i) => Self::sprite_ref(i as u64),
                     None => Value::Null,
                 }
+            }
+            "getBoyfriendPosition" | "getDadPosition" | "getGirlfriendPosition" => {
+                // The stage data's position for that slot (the feet), as a new point.
+                let p = w.and_then(|w| {
+                    let c = &w.stage.characters;
+                    match method {
+                        "getBoyfriendPosition" => c.bf.as_ref(),
+                        "getDadPosition" => c.dad.as_ref(),
+                        _ => c.gf.as_ref(),
+                    }
+                    .map(|s| s.position)
+                });
+                let [x, y] = p.unwrap_or([0.0; 2]);
+                Value::object(vec![("x", Value::Float(x)), ("y", Value::Float(y))])
             }
             "getBoyfriend" | "getDad" | "getGirlfriend" => {
                 let slot = match method {
@@ -4055,6 +4129,8 @@ impl Host for Ctx<'_> {
                     "height" | "frameHeight" => Value::Float(r[3] as f64),
                     "flipX" => Value::Bool(e.flip.unwrap_or(false)),
                     "autoUpdate" => Value::Bool(e.auto_update),
+                    "bopEvery" => Value::Int(e.bop_every),
+                    "bopAngle" => Value::Float(e.bop_angle as f64),
                     "zIndex" => Value::Int(e.z.unwrap_or(match obj.id as usize {
                         HUD_BAR_BG => 800,
                         HUD_BAR => 801,
@@ -4075,6 +4151,14 @@ impl Host for Ctx<'_> {
                 "defaults" => Value::array(vec![Value::Host(HostRef { kind: K_CAMERA, id: 0 })]),
                 _ => Value::Null,
             }),
+            K_ORIGPOS => {
+                let p = self.world.as_deref().and_then(|w| w.chars.get((obj.id & 0xFF) as usize)?.as_ref().map(|c| c.original)).unwrap_or([0.0; 2]);
+                Some(match field {
+                    "x" => Value::Float(p[0] as f64),
+                    "y" => Value::Float(p[1] as f64),
+                    _ => Value::Null,
+                })
+            }
             K_CFOCUS => {
                 let p = self.char_focus(obj.id).unwrap_or([0.0; 2]);
                 Some(match field {
@@ -4493,8 +4577,19 @@ impl Host for Ctx<'_> {
                     "y" => e.pos[1] = Some(v.f() as f32),
                     "flipX" => e.flip = Some(v.truthy()),
                     "autoUpdate" => e.auto_update = v.truthy(),
+                    "bopEvery" => e.bop_every = v.i(),
+                    "bopAngle" => e.bop_angle = v.f() as f32,
                     "zIndex" => e.z = Some(v.i() as i32),
                     _ => {}
+                }
+                true
+            }
+            K_ORIGPOS => {
+                let Some(c) = self.world.as_deref_mut().and_then(|w| w.chars.get_mut((obj.id & 0xFF) as usize)?.as_mut()) else { return Ok(true) };
+                match field {
+                    "x" => c.original[0] = v.f() as f32,
+                    "y" => c.original[1] = v.f() as f32,
+                    _ => return Ok(false),
                 }
                 true
             }
@@ -4768,6 +4863,22 @@ impl Host for Ctx<'_> {
             }
             K_SHADER => Ok(Some(self.shader_call(interp, obj.id, method, &args))),
             K_FILTER => Ok(Some(Value::Null)),
+            K_ORIGPOS => {
+                if let Some(c) = self.world.as_deref_mut().and_then(|w| w.chars.get_mut((obj.id & 0xFF) as usize)?.as_mut()) {
+                    match method {
+                        "set" => {
+                            let x = arg(&args, 0).f() as f32;
+                            c.original = [x, if args.len() > 1 { arg(&args, 1).f() as f32 } else { x }];
+                        }
+                        "add" => {
+                            c.original[0] += arg(&args, 0).f() as f32;
+                            c.original[1] += arg(&args, 1).f() as f32;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some(Value::Host(obj)))
+            }
             K_CFOCUS => {
                 if let Some(c) = self.world.as_deref_mut().and_then(|w| w.chars.get_mut((obj.id & 0xFF) as usize)?.as_mut()) {
                     match method {
@@ -4994,6 +5105,14 @@ impl Host for Ctx<'_> {
             K_STUB => {
                 let name = format!("{}.{method}()", self.state.stubs[obj.id as usize]);
                 interp.warn_once(format!("{name} is not available to scripts yet"));
+                Ok(Some(Value::Null))
+            }
+            // `Conductor.instance.update(t)` with t at or past the start during
+            // the countdown: the song starts there (what skipping does).
+            K_CONDUCTOR if method == "update" => {
+                if args.first().is_some_and(|a| matches!(a, Value::Int(_) | Value::Float(_)) && a.f() >= 0.0) {
+                    self.state.skip_countdown = true;
+                }
                 Ok(Some(Value::Null))
             }
             K_SONG | K_SCAN | K_CONDUCTOR | K_CURANIM | K_MATRIX => Ok(Some(Value::Null)),

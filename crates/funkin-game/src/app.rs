@@ -125,6 +125,15 @@ pub struct App {
     /// When the next frame is due (framerate cap).
     next_frame: Option<Instant>,
     clock: f32,
+    /// The title screen's Y-key window wiggle: when it started and from where.
+    wiggle: Option<(f32, winit::dpi::PhysicalPosition<i32>)>,
+    pads: crate::pad::Pads,
+    /// The next `start_song` restarts the song being played.
+    restarting: bool,
+    /// ...from the pause menu (not a death), so the old notes vwoosh away.
+    restart_vwoosh: bool,
+    /// The restarted song, drawing its notes leaving (`vwooshNotes`).
+    ghost: Option<PlayScene>,
     quit: bool,
     fade: Option<Fade>,
     settings: Settings,
@@ -243,6 +252,11 @@ pub fn run(
         last_frame: None,
         next_frame: None,
         clock: 0.0,
+        wiggle: None,
+        pads: crate::pad::Pads::new(),
+        restarting: false,
+        restart_vwoosh: false,
+        ghost: None,
         quit: false,
         fade: None,
         settings,
@@ -388,6 +402,7 @@ impl App {
             naughty: s.naughtyness,
             skip_ms: 0.0,
             advance_key: s.controls.keys(Control::CutsceneAdvance).first().map_or("?", |&k| crate::settings::key_label(k)),
+            restart: false,
         }
     }
 
@@ -399,6 +414,8 @@ impl App {
         }
         // `--start`: only the first song launched skips ahead.
         prefs.skip_ms = self.skip_ms.take().unwrap_or(0.0);
+        prefs.restart = std::mem::take(&mut self.restarting);
+        let vwoosh = std::mem::take(&mut self.restart_vwoosh) && prefs.restart;
         self.music.stop(&self.audio);
         self.close_pause();
         self.audio.set_paused(false);
@@ -407,8 +424,14 @@ impl App {
             self.deaths = 0;
         }
         let l = self.loaded.as_mut().unwrap();
-        if let Some(old) = self.play.take() {
+        self.ghost = None;
+        if let Some(mut old) = self.play.take() {
+            // The notes are drawn from the note skins, which stay loaded.
             l.gfx.release_textures(old.tex_mark);
+            if vwoosh {
+                old.into_ghost();
+                self.ghost = Some(old);
+            }
         }
         let scene = PlayScene::new(&mut l.gfx, &self.assets, &self.registry, &self.audio, req.clone(), offset, self.botplay, prefs, practice);
         // Whatever loads after this (glyphs, previews) outlives the song.
@@ -511,7 +534,9 @@ impl App {
                 if skip_intro {
                     t.skip_intro_now();
                 }
-                t.start_music(&self.audio, &self.assets, &mut self.music);
+                if !t.delayed() {
+                    t.start_music(&self.audio, &self.assets, &mut self.music);
+                }
                 self.title = Some(t);
             }
             Err(e) => {
@@ -612,6 +637,21 @@ impl App {
             }
         }
         match cmd.as_str() {
+            // `press:NAME` / `release:NAME`: a key (save id, e.g. `LEFT`) or gamepad input (`A`, `DPAD_UP`)
+            // through the normal input path. Pad ids win where they share a name.
+            "fakepad" => self.pads.fake = true,
+            c if c.starts_with("press:") || c.starts_with("release:") => {
+                let (kind, name) = c.split_once(':').unwrap_or_default();
+                let pad = name.strip_prefix("pad:");
+                let code = match pad {
+                    Some(n) => crate::pad::pad_from_id(n),
+                    None => crate::settings::key_from_id(name),
+                };
+                match code {
+                    Some(code) => self.on_input(code, kind == "press", false, Instant::now()),
+                    None => log::warn!("RUSTED_MIC_DEV: unknown key '{name}'"),
+                }
+            }
             // A tap of Space for scripts (`FlxG.keys`), e.g. QT's dodge.
             "space" => {
                 if let Some(s) = self.play.as_mut() {
@@ -669,9 +709,11 @@ impl App {
                     self.act(a);
                 }
             }
-            "down" if self.story.is_some() => {
+            "down" | "up" if self.story.is_some() => {
+                let code = if cmd == "up" { KeyCode::ArrowUp } else { KeyCode::ArrowDown };
                 if let (Some(s), Some(l)) = (&mut self.story, self.loaded.as_mut()) {
-                    let a = s.key(&mut l.gfx, KeyCode::ArrowDown, true, &self.audio);
+                    let a = s.key(&mut l.gfx, code, true, &self.audio);
+                    s.key(&mut l.gfx, code, false, &self.audio);
                     self.act(a);
                 }
             }
@@ -1041,11 +1083,50 @@ impl App {
         false
     }
 
+    /// `FlxTween.tween(window, {x: x + 300}, 1.4, PINGPONG, startDelay 0.35)` and
+    /// `{y: y + 100}, 0.7, PINGPONG`, both quadInOut, until the title screen closes.
+    fn update_wiggle(&mut self) {
+        let Some((start, base)) = self.wiggle else { return };
+        if !matches!(self.state, GameState::Title) {
+            self.wiggle = None;
+            return;
+        }
+        let Some(l) = self.loaded.as_ref() else { return };
+        fn ping_pong(t: f32, dur: f32) -> f32 {
+            let u = (t / dur).max(0.0);
+            let leg = u.floor() as i64;
+            let f = u - leg as f32;
+            let f = if leg % 2 == 0 { f } else { 1.0 - f };
+            // quadInOut
+            if f <= 0.5 { f * f * 2.0 } else { 1.0 - (f - 1.0) * (f - 1.0) * 2.0 }
+        }
+        let t = self.clock - start;
+        let dx = if t < 0.35 { 0.0 } else { 300.0 * ping_pong(t - 0.35, 1.4) };
+        let dy = 100.0 * ping_pong(t, 0.7);
+        let p = winit::dpi::PhysicalPosition::new(base.x + dx.round() as i32, base.y + dy.round() as i32);
+        l.gfx.window().set_outer_position(p);
+    }
+
     fn on_key(&mut self, ev: KeyEvent, at: Instant) {
         let PhysicalKey::Code(code) = ev.physical_key else {
             return;
         };
-        let pressed = ev.state == ElementState::Pressed;
+        // These codes stand for gamepad inputs (`pad.rs`), not keys.
+        if crate::pad::is_pad(code) {
+            return;
+        }
+        self.on_input(code, ev.state == ElementState::Pressed, ev.repeat, at);
+    }
+
+    /// Gamepad inputs since the last frame, fed in like keys.
+    fn poll_pads(&mut self) {
+        for (code, pressed, at) in self.pads.poll() {
+            self.on_input(code, pressed, false, at);
+        }
+    }
+
+    /// A key (or gamepad input) going down or up. `repeat`: the OS key repeat.
+    fn on_input(&mut self, code: KeyCode, pressed: bool, repeat: bool, at: Instant) {
         // `-` + `=` together: toggle botplay (the keys are also the volume keys,
         // so the first key's volume step is undone).
         let combo = match code {
@@ -1054,7 +1135,7 @@ impl App {
             _ => None,
         };
         if let Some(i) = combo {
-            if pressed && !ev.repeat && self.combo_keys[1 - i] {
+            if pressed && !repeat && self.combo_keys[1 - i] {
                 self.combo_keys[i] = true;
                 if let Some((v, m)) = self.volume_before_combo.take() {
                     self.settings.volume = v;
@@ -1073,6 +1154,29 @@ impl App {
             self.shift = pressed;
         }
         let menu = self.settings.controls.menu_key(code);
+        if let (GameState::Title, Some(t)) = (&self.state, self.title.as_mut()) {
+            let c = &self.settings.controls;
+            // `FlxG.keys.pressed.ANY`: the keyboard only, volume keys aside.
+            let is_volume = crate::pad::is_pad(code) || c.is(Control::VolumeUp, code) || c.is(Control::VolumeDown, code) || c.is(Control::VolumeMute, code);
+            t.raw_key(code, pressed, is_volume);
+            if !pressed {
+                if let Some(m) = menu {
+                    t.key_up(m);
+                }
+            }
+            // `FlxG.keys.justPressed.Y`: the window wiggles.
+            if pressed && !repeat && code == KeyCode::KeyY {
+                if let Some(l) = self.loaded.as_ref() {
+                    let w = l.gfx.window();
+                    if w.fullscreen().is_none() {
+                        if let Ok(p) = w.outer_position() {
+                            // Earlier tweens stop where they are; these start from there.
+                            self.wiggle = Some((self.clock, p));
+                        }
+                    }
+                }
+            }
+        }
         if let (GameState::Play(_), Some(scene), Some(k)) = (&self.state, self.play.as_mut(), crate::scripting::flx_key_code(code)) {
             scene.script_key(k, pressed);
         }
@@ -1110,7 +1214,7 @@ impl App {
         }
         // Global hotkeys (not while the controls menu is listening for a key).
         let capturing = self.options.as_ref().is_some_and(|o| o.capturing());
-        if !capturing && !ev.repeat && self.global_key(code) {
+        if !capturing && !repeat && self.global_key(code) {
             return;
         }
         // Nothing underneath takes input while the stickers go on.
@@ -1120,7 +1224,7 @@ impl App {
 
         if let (GameState::Play(_), Some(scene)) = (&self.state, self.play.as_mut()) {
             if let Some(p) = &mut self.pause {
-                let is_pause = self.settings.controls.is(Control::Pause, code) && !ev.repeat;
+                let is_pause = self.settings.controls.is(Control::Pause, code) && !repeat;
                 match p.key(&self.audio, menu, is_pause, self.shift) {
                     PauseAction::None => {}
                     PauseAction::Offset(ms) => {
@@ -1146,40 +1250,46 @@ impl App {
                     }
                     PauseAction::Restart => {
                         let (req, practice) = (scene.request.clone(), p.practice());
+                        self.restarting = true;
+                        self.restart_vwoosh = true;
                         self.start_song(req, practice);
                     }
                     PauseAction::ChangeDifficulty(d) => {
                         let mut req = scene.request.clone();
                         req.difficulty = d;
                         let practice = p.practice();
+                        self.restarting = true;
+                        self.restart_vwoosh = true;
                         self.start_song(req, practice);
                     }
                     PauseAction::Exit => self.exit_with_stickers(StickerExit::Pause),
                 }
                 return;
             }
-            if !ev.repeat && self.settings.controls.is(Control::CutsceneAdvance, code) {
+            if !repeat && self.settings.controls.is(Control::CutsceneAdvance, code) {
                 scene.cutscene_advance();
             }
             if scene.in_conversation() && self.settings.controls.is(Control::Accept, code) {
-                if !ev.repeat {
+                if !repeat {
                     scene.advance_conversation();
                 }
                 return;
             }
             if let Some(lane) = self.settings.controls.note_lane(code) {
-                if !ev.repeat {
+                if !repeat {
                     scene.key_down(&self.audio, lane_direction(lane), at);
                 }
                 return;
             }
-            if ev.repeat {
+            if repeat {
                 return;
             }
             if self.settings.controls.is(Control::Pause, code) {
                 self.open_pause();
             } else if self.settings.controls.is(Control::Reset, code) {
                 scene.reset_death();
+            } else if code == KeyCode::Digit9 {
+                scene.toggle_old_icon();
             }
             return;
         }
@@ -1196,19 +1306,19 @@ impl App {
             return;
         }
         // Tab on the main menu: the mod list.
-        if code == KeyCode::Tab && !ev.repeat && matches!(self.state, GameState::MainMenu) && self.fade.is_none() && self.main_menu.as_ref().is_some_and(|m| m.idle()) {
+        if code == KeyCode::Tab && !repeat && matches!(self.state, GameState::MainMenu) && self.fade.is_none() && self.main_menu.as_ref().is_some_and(|m| m.idle()) {
             self.act(MenuAction::OpenMods);
             return;
         }
         if let Some(c) = &mut self.char_select {
-            if !ev.repeat {
+            if !repeat {
                 let a = c.key(&self.audio, &mut self.music, menu, true);
                 self.act(a);
             }
             return;
         }
         if let Some(o) = &mut self.options {
-            let a = o.key_down(code, menu, ev.repeat, &mut self.settings, &self.audio, &mut self.music, &self.assets);
+            let a = o.key_down(code, menu, repeat, &mut self.settings, &self.audio, &mut self.music, &self.assets);
             if std::mem::take(&mut o.dirty) {
                 self.settings_changed();
             }
@@ -1219,7 +1329,7 @@ impl App {
         let Some(code) = menu else { return };
         let action = match &self.state {
             GameState::Title => match &mut self.title {
-                Some(t) if !ev.repeat => t.key(code, &self.audio),
+                Some(t) if !repeat => t.key(code, &self.audio),
                 _ => MenuAction::None,
             },
             GameState::MainMenu => match &mut self.main_menu {
@@ -1231,7 +1341,7 @@ impl App {
                 None => MenuAction::None,
             },
             GameState::StoryMenu => match (&mut self.story, self.loaded.as_mut()) {
-                (Some(s), Some(l)) if !ev.repeat => s.key(&mut l.gfx, code, true, &self.audio),
+                (Some(s), Some(l)) if !repeat => s.key(&mut l.gfx, code, true, &self.audio),
                 _ => MenuAction::None,
             },
             GameState::GameOver(req) => {
@@ -1241,6 +1351,7 @@ impl App {
                     (KeyCode::Enter, Some(scene)) => scene.death_confirm(&self.audio, &self.assets),
                     (KeyCode::Enter, None) => {
                         self.state.apply(Transition::Retry);
+                        self.restarting = true;
                         self.start_song(req, false);
                     }
                     (KeyCode::Escape, Some(scene)) => {
@@ -1294,6 +1405,13 @@ impl App {
         let frozen = self.unfocused && self.settings.auto_pause;
         let dt = if frozen { 0.0 } else { dt };
         self.clock += dt;
+        self.update_wiggle();
+        self.poll_pads();
+        if let Some(g) = &mut self.ghost {
+            if !g.ghost_tick(dt) || !matches!(self.state, GameState::Play(_)) {
+                self.ghost = None;
+            }
+        }
         self.update_presence();
 
         // Gameplay update first, so input → judgement → draw happens in one frame.
@@ -1377,6 +1495,7 @@ impl App {
             if let crate::game_over::DeathAction::Retry { pixel } = scene.death_update(dt, &self.audio, &self.assets) {
                 let (req, practice) = (req.clone(), scene.practice());
                 self.state.apply(Transition::Retry);
+                self.restarting = true;
                 self.start_song(req, practice);
                 if let Some(s) = self.play.as_mut() {
                     s.fade_in(pixel);
@@ -1447,6 +1566,7 @@ impl App {
         let action = if frozen {
             None
         } else if let Some(o) = &mut self.options {
+            o.gamepad_present = self.pads.connected();
             let a = o.update(dt, &mut self.settings, &self.audio, &mut self.music, &self.assets);
             if std::mem::take(&mut o.dirty) {
                 self.settings_changed();
@@ -1469,7 +1589,10 @@ impl App {
             Some(a)
         } else {
             match &self.state {
-                GameState::Title => self.title.as_mut().map(|t| t.update(dt, music_ms)),
+                GameState::Title => match (self.title.as_mut(), self.loaded.as_mut()) {
+                    (Some(t), Some(l)) => Some(t.update(dt, music_ms, &mut l.gfx, &self.audio, &self.assets, &mut self.music)),
+                    _ => None,
+                },
                 GameState::MainMenu => self.main_menu.as_mut().map(|m| m.update(dt)),
                 GameState::StoryMenu => self.story.as_mut().map(|s| s.update(dt, music_ms)),
                 GameState::Freeplay => {
@@ -1506,6 +1629,10 @@ impl App {
                     if let Some(scene) = &self.play {
                         let skin = if scene.note_style == l.skin.id { &l.skin } else { l.skins.get(&scene.note_style).unwrap_or(&l.skin) };
                         scene.draw(gfx, skin, font, fonts.vcr.as_ref());
+                        if let Some(g) = &self.ghost {
+                            let skin = if g.note_style == l.skin.id { &l.skin } else { l.skins.get(&g.note_style).unwrap_or(&l.skin) };
+                            g.draw_ghost(gfx, skin);
+                        }
                         scene.draw_subtitles(gfx, fonts.vcr.as_ref());
                     }
                     if let Some(p) = &self.pause {
@@ -1522,7 +1649,7 @@ impl App {
                 },
                 GameState::MainMenu | GameState::Freeplay => {
                     match &self.main_menu {
-                        Some(m) => m.draw(gfx),
+                        Some(m) => m.draw(gfx, fonts.vcr.as_ref()),
                         None => gfx.begin([0.0, 0.0, 0.0, 1.0]),
                     }
                     if let (GameState::MainMenu, Some(m)) = (&self.state, &self.mods) {

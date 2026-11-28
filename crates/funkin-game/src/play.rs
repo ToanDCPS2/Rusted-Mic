@@ -56,6 +56,9 @@ pub struct PlayPrefs {
     pub skip_ms: f64,
     /// The first CUTSCENE_ADVANCE key, as the controls menu names it.
     pub advance_key: &'static str,
+    /// A restart of the song being played (pause menu, difficulty change, retry):
+    /// `resetPlayState` instead of a fresh `PlayState`.
+    pub restart: bool,
 }
 
 /// One SRT subtitle (`SubtitleEntry`).
@@ -109,6 +112,31 @@ enum StrumAnim {
     Confirm { since: f64 },
     /// `confirm-hold`: the confirm frames replayed once, then held, while sustaining.
     ConfirmHold { since: f64 },
+}
+
+/// `PlayState.resetPlayState`'s `vwooshDelay`, in ms.
+const VWOOSH_DELAY_MS: f64 = 500.0;
+
+/// `Strumline.fadeInArrow` for lane `i`, `t` s into the song: (alpha, y offset).
+/// `y - 10 → y` and alpha `0 → 1` over 1 s (`circOut`) after `0.5 + 0.2 i` s.
+fn arrow_fade(t: f32, i: usize) -> (f32, f32) {
+    let k = ((t - 0.5 - 0.2 * i as f32) / 1.0).clamp(0.0, 1.0);
+    let e = (1.0 - (k - 1.0) * (k - 1.0)).max(0.0).sqrt();
+    (e, -10.0 * (1.0 - e))
+}
+
+/// `Strumline.vwooshInNotes`: `yOffset` 200 → 0 over 0.5 s (`expoOut`), `t` s after it began.
+fn vwoosh_in(t: f32) -> f32 {
+    let k = (t / 0.5).clamp(0.0, 1.0);
+    let e = if k >= 1.0 { 1.0 } else { 1.0 - 2f32.powf(-10.0 * k) };
+    200.0 * (1.0 - e)
+}
+
+/// `Strumline.vwooshNotes`: notes go a screen height away over 0.5 s (`expoIn`).
+fn vwoosh_out(t: f32) -> f32 {
+    let k = (t / 0.5).clamp(0.0, 1.0);
+    let e = if k <= 0.0 { 0.0 } else { 2f32.powf(10.0 * (k - 1.0)) };
+    VIEW_H * e
 }
 
 /// `StrumlineNote.CONFIRM_HOLD_TIME`, in ms.
@@ -253,12 +281,25 @@ pub struct PlayScene {
     /// The combo before this frame's events (for the combo-break \"000\").
     popup_combo: u32,
     last_countdown_beat: i64,
+    /// A script cancelled a countdown step: no more steps show or sound.
+    countdown_paused: bool,
+    /// `toggleOldIcon` (the 9 key): the other player icon, swapped in and out.
+    old_icon: Option<HealthIcon>,
     countdown_shown: Option<(usize, f64)>,
     /// The game over screen, once the player has died.
     death: Option<crate::game_over::GameOver>,
     /// Retrying after a game over: the game camera fades in from black
     /// (elapsed seconds, and whether in RetroCameraFade's 10 steps).
     intro_fade: Option<(f32, bool)>,
+    /// Seconds of play since the scene opened (stops while paused).
+    scene_time: f32,
+    /// `resetPlayState`: notes vwoosh in, the arrows don't fade in again.
+    restart: bool,
+    /// The vwoosh-in started: notes up to this time (ms) were on screen.
+    vwoosh_cut: Option<f64>,
+    /// `vwooshNotes`: this is the song being restarted, kept only to draw its
+    /// notes falling away; seconds since that began.
+    ghost: Option<f32>,
     rng: u64,
     pub title: String,
     pub song_name: String,
@@ -315,7 +356,7 @@ impl PlayScene {
         request: PlayRequest,
         global_offset_ms: f64,
         botplay: bool,
-        prefs: PlayPrefs,
+        mut prefs: PlayPrefs,
         practice: bool,
     ) -> Result<Self, String> {
         let song = registry
@@ -416,6 +457,18 @@ impl PlayScene {
                 ..Default::default()
             };
             let mut s = crate::scripting::Scripts::load(gfx, assets, audio, world.as_mut(), st, tex_mark);
+            // Before any script event runs: a level whose scripts draw their own
+            // health bar, or move the strumlines, plays without the Psych
+            // Engine health bar / time bar (which would fight them).
+            let hud = s.hud_takeover();
+            if hud.health_bar && prefs.psych_health_bar {
+                log::info!("scripts take over the health bar: Psych Engine health bar off for this song");
+                prefs.psych_health_bar = false;
+            }
+            if hud.strumlines && prefs.psych_time_bar {
+                log::info!("scripts move the strumlines: Psych Engine time bar off for this song");
+                prefs.psych_time_bar = false;
+            }
             s.create(gfx, world.as_mut(), audio);
             s
         };
@@ -443,7 +496,14 @@ impl PlayScene {
             session.player.skip_to(skip_ms);
             session.opponent.skip_to(skip_ms);
         }
-        let start_ms = if skip_ms > 0.0 { skip_ms } else { -beat_ms * 5.0 };
+        // resetPlayState holds the song back another `vwooshDelay` (0.5 s).
+        let start_ms = if skip_ms > 0.0 {
+            skip_ms
+        } else if prefs.restart {
+            -beat_ms * 5.0 - VWOOSH_DELAY_MS
+        } else {
+            -beat_ms * 5.0
+        };
         let song_tracks = tracks.clone();
         let audio_id = audio.play(tracks, start_ms);
 
@@ -462,7 +522,7 @@ impl PlayScene {
             scroll: [ScrollTween::hold(scroll_speed), ScrollTween::hold(scroll_speed)],
             icon_swaps,
             beat_ms,
-            song_pos: -beat_ms * 5.0,
+            song_pos: start_ms,
             strums: [[StrumAnim::Static; 4]; 2],
             strum_timer: [[None; 4]; 2],
             covers: [[None; 4]; 2],
@@ -483,9 +543,15 @@ impl PlayScene {
             popups: Vec::new(),
             popup_combo: 0,
             last_countdown_beat: i64::MIN,
+            countdown_paused: false,
+            old_icon: HealthIcon::load_data(gfx, assets, IconData::old_bf(), true),
             countdown_shown: None,
             death: None,
             intro_fade: None,
+            scene_time: 0.0,
+            restart: prefs.restart,
+            vwoosh_cut: None,
+            ghost: None,
             rng: 0x9E37_79B9_7F4A_7C15,
             title,
             song_name: meta.song_name.clone(),
@@ -552,6 +618,38 @@ impl PlayScene {
     pub fn draw_death(&self, gfx: &mut Gfx) {
         if let (Some(d), Some(w)) = (&self.death, &self.world) {
             d.draw(gfx, w);
+        }
+    }
+
+    /// `vwooshNotes`: from now on this scene only draws its notes leaving.
+    pub fn into_ghost(&mut self) {
+        self.ghost = Some(0.0);
+    }
+
+    /// Advance the vwoosh; false once the notes are gone.
+    pub fn ghost_tick(&mut self, dt: f32) -> bool {
+        match &mut self.ghost {
+            Some(t) => {
+                *t += dt;
+                *t < 0.5
+            }
+            None => false,
+        }
+    }
+
+    /// The leaving notes (both strumlines, on the HUD camera).
+    pub fn draw_ghost(&self, gfx: &mut Gfx, skin: &NoteSkin) {
+        for side in [1, 0] {
+            if self.scripts.state.strum[side].cam < 3 {
+                self.draw_strumline(gfx, skin, side);
+            }
+        }
+    }
+
+    /// `iconP1.toggleOldIcon()` (the 9 key): Boyfriend's old icon, or back.
+    pub fn toggle_old_icon(&mut self) {
+        if let Some(old) = self.old_icon.take() {
+            self.old_icon = self.icons[0].replace(old);
         }
     }
 
@@ -712,7 +810,7 @@ impl PlayScene {
         self.popup_combo = 0;
     }
 
-    /// `PopUpStuff.displayRating` (no style offsets in the base game's styles).
+    /// `PopUpStuff.displayRating`.
     fn display_rating(&mut self, skin: &NoteSkin, j: Judgement) {
         let idx = match j {
             Judgement::Sick => 0,
@@ -727,11 +825,12 @@ impl PlayScene {
         let vy = -self.rand_int(140, 175);
         let vx = -self.rand_int(0, 10);
         let off = self.scripts.state.popup_offsets;
+        let so = skin.rating_off[idx];
         self.popups.push(Popup {
             tex,
             scale,
-            x: VIEW_W * 0.474 - w / 2.0 + off[0],
-            y: VIEW_H * 0.45 - 60.0 - h / 2.0 + off[1],
+            x: VIEW_W * 0.474 - w / 2.0 + off[0] + so[0],
+            y: VIEW_H * 0.45 - 60.0 - h / 2.0 + off[1] + so[1],
             vx,
             vy,
             ay: 550.0,
@@ -760,8 +859,8 @@ impl PlayScene {
             self.popups.push(Popup {
                 tex: skin.digits[d],
                 scale: skin.digit_scale,
-                x: VIEW_W * 0.507 - 36.0 * (i + 1) as f32 - 65.0 + off[0],
-                y: VIEW_H * 0.44 + off[1],
+                x: VIEW_W * 0.507 - 36.0 * (i + 1) as f32 - 65.0 + off[0] + skin.digit_off[d][0],
+                y: VIEW_H * 0.44 + off[1] + skin.digit_off[d][1],
                 vx,
                 vy,
                 ay,
@@ -800,11 +899,25 @@ impl PlayScene {
             if beat != self.last_countdown_beat && (-4..=-1).contains(&beat) {
                 self.last_countdown_beat = beat;
                 let step = (beat + 4) as usize;
-                if let Some(s) = &skin.countdown_sfx[step] {
-                    audio.play_sfx(s.clone(), 0.6);
+                // A script cancelling a step (`pauseCountdown`) stops the rest.
+                if !self.countdown_paused {
+                    if let Some(s) = &skin.countdown_sfx[step] {
+                        audio.play_sfx(s.clone(), 0.6);
+                    }
+                    self.countdown_shown = (step > 0).then_some((step - 1, pos));
+                    let name = ["THREE", "TWO", "ONE", "GO"][step];
+                    let ev = crate::scripting::event(vec![("step", Value::str(name))]);
+                    self.scripts.dispatch(gfx, self.world.as_mut(), audio, "onCountdownStep", ev.clone());
+                    if ev.field("eventCanceled").is_some_and(|v| v.truthy()) {
+                        self.countdown_paused = true;
+                    }
                 }
-                self.countdown_shown = (step > 0).then_some((step - 1, pos));
             }
+        } else if (-4..=-1).contains(&self.last_countdown_beat) && !self.countdown_paused {
+            // countdownStep == AFTER.
+            self.last_countdown_beat = 0;
+            let ev = crate::scripting::event(vec![("step", Value::str("AFTER"))]);
+            self.scripts.dispatch(gfx, self.world.as_mut(), audio, "onCountdownEnd", ev);
         }
 
         let mut events = std::mem::take(&mut self.events);
@@ -966,6 +1079,12 @@ impl PlayScene {
             .map(|t| now.duration_since(t).as_secs_f64().min(0.1))
             .unwrap_or(0.0);
         self.last_frame = Some(now);
+        self.scene_time += elapsed as f32;
+        if self.restart && self.vwoosh_cut.is_none() && self.scene_time >= (VWOOSH_DELAY_MS / 1000.0) as f32 {
+            // vwooshTimer: the notes now on screen come in from 200 px out.
+            let px_per_ms = PIXELS_PER_MS * self.scroll[0].at(pos).max(self.scroll[1].at(pos));
+            self.vwoosh_cut = Some(pos + 720.0 / px_per_ms);
+        }
         if let Some((t, _)) = &mut self.intro_fade {
             *t += elapsed as f32;
             if *t >= 1.0 {
@@ -1059,6 +1178,8 @@ impl PlayScene {
         for (k, icon) in self.icons.iter_mut().enumerate() {
             let Some(icon) = icon else { continue };
             let e = &mut st.hud[crate::scripting::HUD_ICON_P1 + k];
+            icon.bop_every = e.bop_every;
+            icon.bop_angle = e.bop_angle;
             for s in from..=step {
                 icon.on_step(s, step_ms, st.icon_bop_scale);
             }
@@ -1263,6 +1384,10 @@ impl PlayScene {
 
     /// One strumline: its background, receptors, notes and hold covers.
     fn draw_strumline(&self, gfx: &mut Gfx, skin: &NoteSkin, side: usize) {
+        let mut kept_params = crate::gfx::shader::ShaderParams::default();
+        kept_params.set("hue", vec![0.0]);
+        kept_params.set("sat", vec![0.2]);
+        kept_params.set("val", vec![1.0]);
         let pos = self.song_pos;
         let (xs, side_alpha) = self.layout();
         let ss = &self.scripts.state.strum[side];
@@ -1276,13 +1401,15 @@ impl PlayScene {
         };
         let [ox, oy] = ss.off;
         let sign = if self.prefs.downscroll { -1.0 } else { 1.0 };
+        let ghost = self.ghost.is_some();
+        let ghost_dy = self.ghost.map_or(0.0, |t| sign * vwoosh_out(t));
         let sy = self.strum_y(skin) + oy;
         // `Strumline.getXPos` + the strumline's x: each lane's left edge.
         let lane_x = |cx: f32| cx - STRUMLINE_SIZE / 2.0;
         let xs = xs.map(|l| l.map(|c| c.map(|c| c + ox)));
 
         // Strumline backgrounds (`Strumline.background`, 16 px padding).
-        if self.prefs.strumline_bg > 0.0 && ss.part_visible[crate::scripting::SG_BG] {
+        if self.prefs.strumline_bg > 0.0 && ss.part_visible[crate::scripting::SG_BG] && !ghost {
             {
                 let (Some(first), Some(last)) = (xs[side][0], xs[side][3]) else { return };
                 if last - first > 4.0 * NOTE_SPACING {
@@ -1313,11 +1440,16 @@ impl PlayScene {
             let strum_scale = ss.scale.map(|s| s[0]).unwrap_or(skin.strum_scale);
             for lane in 0..4 {
                 let Some(cx) = xs[side][lane] else { continue };
-                if !strums_on || !ss.lane_visible[lane] {
+                if !strums_on || !ss.lane_visible[lane] || ghost {
                     continue;
                 }
-                let lo = ss.lane_off[lane];
-                let la = sa * ss.lane_alpha[lane] * ss.part_alpha[crate::scripting::SG_STRUMS];
+                let mut lo = ss.lane_off[lane];
+                let mut la = sa * ss.lane_alpha[lane] * ss.part_alpha[crate::scripting::SG_STRUMS];
+                if !self.restart {
+                    let (fa, fy) = arrow_fade(self.scene_time, lane);
+                    la *= fa;
+                    lo[1] += fy;
+                }
                 let (anim, t) = match self.strums[side][lane] {
                     StrumAnim::Static => (&skin.statics[lane], 0.0),
                     StrumAnim::Press => (&skin.presses[lane], 0.0),
@@ -1343,6 +1475,10 @@ impl PlayScene {
                 let lane = n.direction.index();
                 let Some(cx) = xs[side][lane] else { continue };
                 let dist = |t: f64| ((t - pos) as f32) * px_per_ms;
+                let vw = match self.vwoosh_cut {
+                    Some(cut) if n.strum_time() <= cut => sign * vwoosh_in(self.scene_time - (VWOOSH_DELAY_MS / 1000.0) as f32),
+                    _ => 0.0,
+                } + ghost_dy;
 
                 if let Some(h) = &n.hold {
                     // A dropped hold is hidden completely (`holdNote.alpha = 0`).
@@ -1354,7 +1490,7 @@ impl PlayScene {
                         if far > near {
                             // Strumline: y = strum.y - INITIAL_OFFSET + noteY + STRUMLINE_SIZE / 2
                             // (the trail's near end), drawn at minus the style's offsets.
-                            let near_y = sy - RECEPTOR_INITIAL_OFFSET + sign * near + STRUMLINE_SIZE / 2.0 - skin.hold_off[1] + ss.hold_dy.get(&idx).copied().unwrap_or(0.0);
+                            let near_y = sy - RECEPTOR_INITIAL_OFFSET + sign * near + STRUMLINE_SIZE / 2.0 - skin.hold_off[1] + ss.hold_dy.get(&idx).copied().unwrap_or(0.0) + vw;
                             let x = match ss.hold_x.get(&idx) {
                                 Some(&x) => x + hold_w / 2.0,
                                 None => cx - skin.hold_off[0],
@@ -1364,9 +1500,9 @@ impl PlayScene {
                         }
                     }
                 }
-                if !n.has_been_hit && ss.part_visible[crate::scripting::SG_NOTES] {
+                if (!n.has_been_hit || n.kept) && ss.part_visible[crate::scripting::SG_NOTES] {
                     // NoteSprite: centred on the lane minus NUDGE, top at strum.y - INITIAL_OFFSET + noteY.
-                    let y = sy - RECEPTOR_INITIAL_OFFSET + sign * dist(n.strum_time()) + skin.note_h[lane] / 2.0 + ss.dy.get(&idx).copied().unwrap_or(0.0);
+                    let y = sy - RECEPTOR_INITIAL_OFFSET + sign * dist(n.strum_time()) + skin.note_h[lane] / 2.0 + ss.dy.get(&idx).copied().unwrap_or(0.0) + vw;
                     let x = match ss.note_x.get(&idx) {
                         // A script's x is the sprite's left edge (hitbox at the skin's scale).
                         Some(&x) => x + skin.notes.frames[skin.note_frames[lane]].frame_w * skin.note_scale / 2.0,
@@ -1375,14 +1511,26 @@ impl PlayScene {
                     let scale = ss.note_scale.get(&idx).map(|s| s[0]).unwrap_or(skin.note_scale);
                     let a = sa * ss.note_alpha.get(&idx).copied().unwrap_or(1.0) * ss.part_alpha[crate::scripting::SG_NOTES];
                     if y > -400.0 && y < VIEW_H + 400.0 {
-                        skin.notes.draw_centered(gfx, skin.note_frames[lane], x, y, scale, [1.0, 1.0, 1.0, a]);
+                        if n.has_been_hit {
+                            // A combo-break hit stays: `alpha = 0.5`, `desaturate()` (saturation 0.2).
+                            let shader = gfx.shader_program(crate::gfx::builtin_shaders::HSV_SHADER, false).ok();
+                            if let Some(id) = shader {
+                                gfx.set_shader(Some((id, &kept_params, Default::default())));
+                            }
+                            skin.notes.draw_centered(gfx, skin.note_frames[lane], x, y, scale, [1.0, 1.0, 1.0, a * 0.5]);
+                            if shader.is_some() {
+                                gfx.set_shader(None);
+                            }
+                        } else {
+                            skin.notes.draw_centered(gfx, skin.note_frames[lane], x, y, scale, [1.0, 1.0, 1.0, a]);
+                        }
                     }
                 }
             }
         }
 
         // Hold covers above the strumlines (`noteHoldCovers.zIndex = 40`).
-        if ss.part_visible[crate::scripting::SG_COVERS] {
+        if ss.part_visible[crate::scripting::SG_COVERS] && !ghost {
             #[allow(clippy::needless_range_loop)]
             for lane in 0..4 {
                 let (Some(c), Some((atlas, anims)), Some(cx)) = (self.covers[side][lane], skin.covers.get(lane), xs[side][lane]) else {
@@ -1405,7 +1553,7 @@ impl PlayScene {
         }
 
         // Note splashes above the hold covers (`noteSplashes.zIndex = 50`).
-        if let Some(sp) = skin.splash.as_ref().filter(|_| ss.part_visible[crate::scripting::SG_SPLASHES]) {
+        if let Some(sp) = skin.splash.as_ref().filter(|_| ss.part_visible[crate::scripting::SG_SPLASHES] && !ghost) {
             let s = sp.scale;
             let (fw, fh) = sp.atlas.frames.first().map_or((0.0, 0.0), |f| (f.frame_w, f.frame_h));
             gfx.set_blend(sp.blend);
@@ -1762,7 +1910,8 @@ impl PlayScene {
             let (w, h) = gfx.texture_size(t);
             let s = skin.countdown_scale;
             let fade = if skin.countdown_pixel { stepped(age as f32, 8.0) } else { cube_in_out(age as f32) };
-            gfx.sprite(t, (VIEW_W - w * s) / 2.0, (VIEW_H - h * s) / 2.0, s, [1.0, 1.0, 1.0, 1.0 - fade]);
+            let o = skin.countdown_off[i];
+            gfx.sprite(t, (VIEW_W - w * s) / 2.0 + o[0], (VIEW_H - h * s) / 2.0 + o[1], s, [1.0, 1.0, 1.0, 1.0 - fade]);
         }
     }
 
@@ -1850,7 +1999,7 @@ impl PlayScene {
         se.rect.set([sx, sy, 380.0, 20.0]);
         if se.visible && se.alpha > 0.0 {
             match vcr {
-                Some(v) => crate::menus::options::draw_outlined_alpha(gfx, v, &score, sx, sy, 16.0, 1.0, se.alpha),
+                Some(v) => draw_score_text(gfx, v, &score, sx, sy, se.alpha),
                 None => {
                     font.draw(gfx, &score.to_uppercase(), sx, sy, 0.35, [1.0, 1.0, 1.0, se.alpha]);
                 }
@@ -1951,6 +2100,33 @@ impl PlayScene {
             }
             _ => {}
         }
+    }
+}
+
+/// `scoreText`: an `FlxBitmapText` in `vcr-bmp` (VCR at 16 px, whole-pixel
+/// advances) with `letterSpacing = -1` and a 1 px black outline. Drawn from
+/// the TrueType VCR, which sits a pixel right of and below the bitmap glyphs.
+fn draw_score_text(gfx: &mut Gfx, v: &TtfFont, text: &str, x: f32, y: f32, alpha: f32) {
+    if alpha <= 0.0 {
+        return;
+    }
+    let (x, y) = (x - 1.0, y - 1.0);
+    let mut xs = Vec::new();
+    let mut cx = x;
+    let mut buf = [0u8; 4];
+    for ch in text.chars() {
+        let s: &str = ch.encode_utf8(&mut buf);
+        xs.push((cx, ch));
+        cx += v.width(gfx, s, 16.0).ceil() - 1.0;
+    }
+    // The outline first (all of it), then the white text over it.
+    for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+        for &(gx, ch) in &xs {
+            v.draw(gfx, ch.encode_utf8(&mut buf), gx + dx, y + dy, 16.0, [0.0, 0.0, 0.0, alpha]);
+        }
+    }
+    for &(gx, ch) in &xs {
+        v.draw(gfx, ch.encode_utf8(&mut buf), gx, y, 16.0, [1.0, 1.0, 1.0, alpha]);
     }
 }
 

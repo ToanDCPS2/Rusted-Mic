@@ -111,6 +111,9 @@ fn prefs() -> Vec<Pref> {
     ]
 }
 
+/// The gamepad's Back (Select) button, which cancels a gamepad rebind.
+const PAD_BACK: KeyCode = KeyCode::F27;
+
 /// `ControlsMenu.controlGroups`: controls that can't share a key (a clash swaps).
 const GROUPS: &[&[Control]] = &[
     &[Control::NoteUp, Control::NoteDown, Control::NoteLeft, Control::NoteRight],
@@ -157,9 +160,15 @@ const CONTROL_ROWS: &[(Option<&str>, Control)] = &[
 /// `ControlsMenu.onInputSelect` on the keyboard: bind `key` (None = unbind) to
 /// column `col` of `control`. Returns false if the change is refused (the last
 /// key of a UI control can't be unbound).
+#[cfg(test)]
 pub fn rebind(c: &mut Controls, control: Control, col: usize, key: Option<KeyCode>) -> bool {
-    let slots = |c: &Controls, ctl: Control| -> [Option<KeyCode>; 2] {
-        let k = c.keys(ctl);
+    rebind_on(c, false, control, col, key)
+}
+
+/// [`rebind`] on the keyboard (`pad` false) or gamepad bindings.
+pub fn rebind_on(c: &mut Controls, pad: bool, control: Control, col: usize, key: Option<KeyCode>) -> bool {
+    let slots = |c: &mut Controls, ctl: Control| -> [Option<KeyCode>; 2] {
+        let k = c.device(pad).get(&ctl).map(|v| v.as_slice()).unwrap_or(&[]);
         [k.first().copied(), k.get(1).copied()]
     };
     let mine = slots(c, control);
@@ -175,7 +184,7 @@ pub fn rebind(c: &mut Controls, control: Control, col: usize, key: Option<KeyCod
         // A clash inside the group swaps the two keys.
         if let Some(group) = GROUPS.iter().find(|g| g.contains(&control)) {
             for &other in group.iter().filter(|&&o| o != control) {
-                let keys = c.binds.entry(other).or_default();
+                let keys = c.device(pad).entry(other).or_default();
                 if let Some(j) = keys.iter().take(2).position(|&x| x == k) {
                     match mine[col] {
                         Some(old) => keys[j] = old,
@@ -188,7 +197,7 @@ pub fn rebind(c: &mut Controls, control: Control, col: usize, key: Option<KeyCod
         }
     }
     // Unbound slots shift left: column 1 of an empty row becomes column 0.
-    let keys = c.binds.entry(control).or_default();
+    let keys = c.device(pad).entry(control).or_default();
     match key {
         Some(k) if col < keys.len() => keys[col] = k,
         Some(k) => keys.insert(keys.len().min(col), k),
@@ -364,6 +373,18 @@ pub struct Options {
     hold: Hold,
     ctl_sel: usize,
     ctl_scroll: f32,
+    /// A gamepad is connected (set by the app each frame).
+    pub gamepad_present: bool,
+    /// The controls page has the Keyboard / Gamepad bar (a gamepad was
+    /// connected when it opened).
+    ctl_devices: bool,
+    /// The bar has focus, and which device is highlighted (0 keys, 1 gamepad).
+    ctl_on_devices: bool,
+    ctl_device: usize,
+    /// Editing the gamepad bindings.
+    ctl_pad: bool,
+    /// A device was picked: it flickers, then the grid takes over.
+    ctl_device_pick: Option<f32>,
     /// Waiting for a key; holds the key that opened the prompt until it's released.
     rebinding: Option<Option<KeyCode>>,
     popup: bool,
@@ -447,6 +468,12 @@ impl Options {
             hold: Hold::default(),
             ctl_sel: 0,
             ctl_scroll: 0.0,
+            gamepad_present: false,
+            ctl_devices: false,
+            ctl_on_devices: false,
+            ctl_device: 0,
+            ctl_pad: false,
+            ctl_device_pick: None,
             rebinding: None,
             popup: false,
             prompt: None,
@@ -578,6 +605,27 @@ impl Options {
                 }
                 _ => {}
             },
+            Page::Controls if self.ctl_device_pick.is_some() => {}
+            Page::Controls if self.ctl_on_devices => match code {
+                // `deviceList`: horizontal, no wrap.
+                KeyCode::ArrowLeft if self.ctl_device == 1 => {
+                    self.ctl_device = 0;
+                    self.sfx(audio, &self.scroll_sfx, 0.4);
+                }
+                KeyCode::ArrowRight if self.ctl_device == 0 => {
+                    self.ctl_device = 1;
+                    self.sfx(audio, &self.scroll_sfx, 0.4);
+                }
+                KeyCode::Enter if !repeat => {
+                    self.sfx(audio, &self.confirm_sfx, 1.0);
+                    self.ctl_device_pick = Some(self.time);
+                }
+                KeyCode::Escape if !repeat => {
+                    self.back(audio);
+                    self.page = Page::Main;
+                }
+                _ => {}
+            },
             Page::Controls => {
                 let n = CONTROL_ROWS.len() * 2;
                 match code {
@@ -598,6 +646,8 @@ impl Options {
                         self.sfx(audio, &self.scroll_sfx, 0.4);
                     }
                     KeyCode::Enter if !repeat => self.rebinding = Some(Some(raw)),
+                    // goToDeviceList
+                    KeyCode::Escape if !repeat && self.ctl_devices => self.ctl_on_devices = true,
                     KeyCode::Escape if !repeat => {
                         self.back(audio);
                         self.page = Page::Main;
@@ -644,7 +694,7 @@ impl Options {
             }
         }
         if self.popup {
-            if raw == KeyCode::Escape {
+            if raw == KeyCode::Escape || (self.ctl_pad && raw == PAD_BACK) {
                 self.popup = false;
             }
             return;
@@ -663,11 +713,17 @@ impl Options {
                 return;
             }
             KeyCode::Backspace => None,
-            k if crate::settings::key_id(k).is_some() => Some(k),
+            // On the gamepad, Back cancels and any other button binds.
+            PAD_BACK if self.ctl_pad => {
+                self.rebinding = None;
+                return;
+            }
+            k if self.ctl_pad && crate::pad::is_pad(k) => Some(k),
+            k if !self.ctl_pad && crate::settings::key_id(k).is_some() => Some(k),
             _ => return,
         };
         self.rebinding = None;
-        if rebind(&mut settings.controls, control, col, new) {
+        if rebind_on(&mut settings.controls, self.ctl_pad, control, col, new) {
             self.dirty = true;
         } else {
             self.popup = true;
@@ -706,7 +762,15 @@ impl Options {
         match p {
             Pending::Main(i) => match MAIN_ITEMS[i] {
                 "PREFERENCES" => self.page = Page::Prefs,
-                "CONTROLS" => self.page = Page::Controls,
+                "CONTROLS" => {
+                    self.page = Page::Controls;
+                    self.ctl_devices = self.gamepad_present;
+                    self.ctl_on_devices = self.ctl_devices;
+                    self.ctl_device = 0;
+                    self.ctl_pad = false;
+                    self.ctl_device_pick = None;
+                    self.ctl_scroll = 0.0;
+                }
                 "LAG ADJUSTMENT" => {
                     let v = music.volume();
                     music.fade(v, 0.0, 0.5);
@@ -941,7 +1005,16 @@ impl Options {
                 self.pref_scroll = follow_lerp(self.pref_scroll, target, dt, 0.085);
             }
             Page::Controls => {
-                let y = self.control_y(self.ctl_sel / 2);
+                if let Some(at) = self.ctl_device_pick {
+                    // selectDevice, after the 1 s flicker.
+                    if self.time - at >= 1.0 {
+                        self.ctl_device_pick = None;
+                        self.ctl_pad = self.ctl_device == 1;
+                        self.ctl_on_devices = false;
+                    }
+                }
+                // camFollow: the device bar, or the selected row.
+                let y = if self.ctl_on_devices { 0.0 } else { self.control_y(self.ctl_sel / 2) };
                 let target = deadzone_target(self.ctl_scroll, y, 70.0, 100.0, VIEW_H - 200.0, 0.0);
                 self.ctl_scroll = follow_lerp(self.ctl_scroll, target, dt, 0.06);
             }
@@ -1022,7 +1095,7 @@ impl Options {
     }
 
     fn control_y(&self, row: usize) -> f32 {
-        let mut y = 30.0;
+        let mut y = if self.ctl_devices { 120.0 } else { 30.0 };
         for (i, (header, _)) in CONTROL_ROWS.iter().enumerate() {
             if header.is_some() {
                 y += 70.0;
@@ -1166,20 +1239,36 @@ impl Options {
 
     fn draw_controls(&self, gfx: &mut Gfx, fonts: &Fonts, settings: &Settings) {
         let scroll = self.ctl_scroll;
-        let mut y = 30.0 - scroll;
+        if self.ctl_devices {
+            // devicesBg: FlxG.width × 100, 0xFFFAFD6D, with the two device items.
+            gfx.rect(0.0, -scroll, VIEW_W, 100.0, [0xFA as f32 / 255.0, 0xFD as f32 / 255.0, 0x6D as f32 / 255.0, 1.0]);
+            let h = fonts.bold.max_height;
+            for (i, name) in ["Keyboard", "Gamepad"].iter().enumerate() {
+                let w = fonts.bold.width(name, 1.0);
+                let x = if i == 0 { VIEW_W / 2.0 - w - 30.0 } else { VIEW_W / 2.0 + 30.0 };
+                let picked = self.ctl_device_pick.is_some_and(|at| i == self.ctl_device && !super::flicker_visible(self.time - at, 0.06));
+                if picked {
+                    continue;
+                }
+                let a = if i == self.ctl_device { 1.0 } else { IDLE_ALPHA };
+                fonts.bold.draw(gfx, name, x, (100.0 - h) / 2.0 - scroll, 1.0, [1.0, 1.0, 1.0, a]);
+            }
+        }
+        let mut y = if self.ctl_devices { 120.0 } else { 30.0 } - scroll;
         for (row, (header, control)) in CONTROL_ROWS.iter().enumerate() {
             if let Some(h) = header {
                 fonts.bold.draw_centered(gfx, h, VIEW_W / 2.0, y, 1.0, WHITE);
                 y += 70.0;
             }
             if (-100.0..VIEW_H + 50.0).contains(&y) {
-                let row_sel = self.ctl_sel / 2 == row;
+                let grid = !self.ctl_on_devices && self.ctl_device_pick.is_none();
+                let row_sel = grid && self.ctl_sel / 2 == row;
                 let a = if row_sel { 1.0 } else { IDLE_ALPHA };
                 fonts.bold.draw(gfx, control.label(), 50.0, y, 1.0, [1.0, 1.0, 1.0, a]);
-                let keys = settings.controls.keys(*control);
+                let keys = if self.ctl_pad { settings.controls.pad_keys(*control) } else { settings.controls.keys(*control) };
                 for col in 0..2 {
                     let label = keys.get(col).map(|&k| crate::settings::key_label(k)).unwrap_or("---");
-                    let a = if self.ctl_sel == row * 2 + col { 1.0 } else { IDLE_ALPHA };
+                    let a = if grid && self.ctl_sel == row * 2 + col { 1.0 } else { IDLE_ALPHA };
                     fonts.default.draw(gfx, label, 750.0 + col as f32 * 300.0, y, 1.0, [1.0, 1.0, 1.0, a]);
                 }
             }
@@ -1189,12 +1278,18 @@ impl Options {
         if self.rebinding.is_some() || self.popup {
             gfx.rect(0.0, 0.0, VIEW_W, VIEW_H, [0.0, 0.0, 0.0, 128.0 / 255.0]);
         }
+        // selectDevice rewrites the prompts once a device is picked.
+        let (prompt, popup) = match (self.ctl_devices, self.ctl_pad) {
+            (false, _) => ("\nPress any key to rebind\n\n\nBackspace to unbind\n    Escape to cancel", "\nYou cannot unbind\nthat key!\n\n\nEscape to exit"),
+            (true, false) => ("\nPress any key to rebind\n\n\n\n    Escape to cancel", "\nYou cannot unbind\nthat key!\n\n\nEscape to exit"),
+            (true, true) => ("\nPress any button\n   to rebind\n\n\n Back to cancel", "\nYou cannot unbind\nthat button!\n\n\nBack to exit"),
+        };
         if self.rebinding.is_some() {
             gfx.rect(100.0, 100.0, VIEW_W - 200.0, VIEW_H - 200.0, YELLOW);
-            draw_block(gfx, &fonts.bold, "\nPress any key to rebind\n\n\nBackspace to unbind\n    Escape to cancel", 100.0);
+            draw_block(gfx, &fonts.bold, prompt, 100.0);
         } else if self.popup {
             gfx.rect(100.0, 100.0, VIEW_W - 200.0, VIEW_H - 200.0, YELLOW);
-            draw_block(gfx, &fonts.bold, "\nYou cannot unbind\nthat key!\n\n\nEscape to exit", 100.0);
+            draw_block(gfx, &fonts.bold, popup, 100.0);
         }
     }
 

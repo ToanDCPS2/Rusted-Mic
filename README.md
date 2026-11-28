@@ -17,7 +17,7 @@ charts with the original judgement, scoring, menus and options.
 - **Platform:** Windows 11, x86_64 (Windows 10 should work but is untested), and
   Linux x86_64 (built on Ubuntu 26.04, needs glibc 2.43+; lightly tested). Everything uses portable crates
   or has a Linux code path.
-- **Version:** 0.3.0, a pre-release. See *What's new in 0.3.0* below.
+- **Version:** 0.3.1, a pre-release. See *What's new in 0.3.1* below.
 - **Status:** early and incomplete. See *How much is ported* and *Known issues*.
 
 ## Credits
@@ -45,21 +45,21 @@ interpreter (see *Mods*).
 
 | Area | Ported | Notes |
 |---|---|---|
-| Chart loading, conductor, BPM / time-signature changes | ~95% | All 2.x song data, variations and difficulties |
-| Judgement, scoring, health, combo, ranks | ~95% | PBOT1 curve and hit windows, hold bonuses and drop penalties |
-| Notes, holds, strumlines, note styles (incl. pixel) | ~90% | Note splashes and hold covers from the note style |
-| HUD: health bar, icons, score, popups, countdown | ~80% | |
+| Chart loading, conductor, BPM / time-signature changes | 100% | All 2.x song data, variations and difficulties |
+| Judgement, scoring, health, combo, ranks | 100% | PBOT1 curve and hit windows, hold bonuses and drop penalties |
+| Notes, holds, strumlines, note styles (incl. pixel) | 100% | Note splashes and hold covers from the note style; bad and shit hits stay on screen half see-through and desaturated; the arrows fade in at the start, and a restart sends the notes away and back in |
+| HUD: health bar, icons, score, popups, countdown | 100% | The score text spaced like the original's bitmap font; note-style offsets on ratings, combo numbers and countdown sprites; `onCountdownStep` / `onCountdownEnd` (cancellable); icon `bopEvery` / `bopAngle` tilt, tall icons, and the 9 key's old Boyfriend icon |
 | Stages and characters | ~75% | Drawn and animated, including Animate atlases. Stage and character scripts run through the `.hxc` interpreter (script-fetched characters, sprite groups, skewed sprites, backdrops, trails, `FlxText` and lip-sync sprites inside atlases included); some engine APIs they call are still missing |
 | Song events (camera focus, zoom, bops, animations) | ~70% | |
 | Pause menu | ~85% | Resume, restart, change difficulty, practice mode, offset hotkeys |
-| Options (preferences, controls, lag adjustment, clear save) | ~90% | Plus Middlescroll, Hide Opponent Notes, Ghost Tapping and Psych Engine's time bar and health bar (all off by default), and Note Splashes and Antialiasing toggles (on by default). No gamepads. |
-| Title screen, main menu | ~90% | Merch opens the store page |
+| Options (preferences, controls, lag adjustment, clear save) | 100% | Plus Middlescroll, Hide Opponent Notes, Ghost Tapping and Psych Engine's time bar and health bar (all off by default), and Note Splashes and Antialiasing toggles (on by default). Gamepads work everywhere, with the original's default buttons, and Controls gets the Keyboard / Gamepad bar when one is connected |
+| Title screen, main menu | 100% | Hue shift on Left / Right, the cheat code, the Y-key window wiggle, and the attract trailers after 37.5 s (hold any key to skip); the main menu's version watermark and exit timing. Merch opens the store page |
 | Freeplay | ~65% | Song list, difficulties, previews and DJ, for Boyfriend and Pico (with Pico's DJ, card and style), album art and difficulty stars, saved scores and clear percentages, the "Press [ TAB ]" hint and the slide to and from character select; no letter sort or favourites |
 | Character select | ~85% | Opened with Tab in freeplay: the grid, locks, both characters and their partners, Nene's speaker visualizer, cursors and sounds. The first visit plays the lights video, then each newly unlocked character's lock opens (remembered in `save.json`). No nametag mosaic or confirm pitch bend; Pico counts as unlocked without beating Weekend 1, since there are no saved scores |
 | Transitions (fade, sticker transition) | ~70% | |
 | Game over screen | ~80% | Death animations, camera, music, retry and Tankman's quotes; Pico's can explosion death (2hot) and the 1-in-4096 fakeout are not ported |
 | Results screen | ~80% | The full results screen: score, tallies and clear percentage counting up, the rank and its music, and the player character's rank animations (scripted ones included); new highscores are saved |
-| Credits | ~90% | The base game builds its credits into `Funkin.exe`; setup recovers them from your own copy into `data/credits.json` |
+| Credits | 100% | The base game builds its credits into `Funkin.exe`; setup recovers them from your own copy into `data/credits.json`. Consolas on Windows, Courier New (or the system's monospace font) on Linux |
 | Mods (V-Slice / Polymod) | ~60% | Mods in the `mods` folder are layered over the assets in a load order you set in the mods menu, and their `.hxc` scripts run through the interpreter. Many common engine APIs are bound; mods that call ones that aren't yet log a warning for that call and carry on |
 | Story mode | ~60% | The story menu, and each week played through in order with its cutscenes |
 | Dialogue, cutscenes, videos | ~75% | Dialogue, scripted in-engine cutscenes (Spaghetti's intro included, skippable with the cutscene key) and every base-game video (H.264, HEVC and VP9, in MP4 or MKV) play. Spaghetti's audio, which the base game keeps inside `Funkin.exe`, is extracted from your own copy on first launch |
@@ -68,7 +68,7 @@ interpreter (see *Mods*).
 
 ## Known issues
 
-- **Not ported:** gamepad support, freeplay letter sort and favourites, Pico's
+- **Not ported:** freeplay letter sort and favourites, Pico's
   can explosion death (2hot) and the 1-in-4096 game over fakeout, character
   select's nametag mosaic and confirm pitch bend, Pico's card confirm
   animation, the `BlurFilter`, `TextureSwap` and `OverlayBlend` shaders, and
@@ -79,13 +79,30 @@ interpreter (see *Mods*).
   the beginning; play from the start when testing cutscenes.
 - **Recently added and only lightly tested:** the Linux build, note splashes,
   animated health icons, the mod load order and restart, the cutscene pause
-  menu, and the Antialiasing option.
+  menu, the Antialiasing option, and gamepads (tested through the game's own
+  input path, not yet with a physical controller).
 - Character select treats Pico as unlocked even before Weekend 1 is beaten.
 - The pause music keeps playing when the window loses focus.
-- The score text uses the VCR TrueType font. The newest upstream code uses a
-  bitmap version that the 0.8.6 assets don't include.
 - Discord Rich Presence needs your own Discord application id (see below).
 - Linux: built on Ubuntu 26.04 (WSL) and only lightly tested.
+
+## What's new in 0.3.1
+
+Rounds off several areas to 100% (see *How much is ported*).
+
+- **Gamepads** (gilrs): menus, gameplay and rebinding, with the original's
+  default buttons, and a Keyboard / Gamepad bar in Options → Controls.
+- **HUD:** the score text spaced like the original's bitmap font; note-style
+  offsets on ratings, combo numbers and countdown sprites; `onCountdownStep` /
+  `onCountdownEnd` for scripts (cancellable); health icon `bopEvery` /
+  `bopAngle`, tall icons, and the 9 key's old Boyfriend icon.
+- **Notes:** bad and shit hits stay on screen, half see-through and
+  desaturated; the arrows fade in at the start; restarting from the pause
+  menu sends the notes away and back in.
+- **Title and main menu:** hue shift on Left / Right, the cheat code, the Y-key
+  window wiggle, the attract trailers after 37.5 s, the version watermark and
+  the original exit timing.
+- **Credits:** Consolas on Windows, a monospace system font on Linux.
 
 ## What's new in 0.3.0
 
@@ -199,16 +216,16 @@ A pre-release. Everything below is new since 0.2.0.
 
 1. Download the archive for your system from the latest release and unpack it
    into its own folder:
-   - Windows: `RustedMic-0.3.0-windows-x64.zip` (`RustedMic.exe`).
-   - Linux: `RustedMic-0.3.0-linux-x64.tar.gz` (`RustedMic`). It needs ALSA
-     and GTK 3 at run time (present on most desktops), X11 or Wayland, and
+   - Windows: `RustedMic-0.3.1-windows-x64.zip` (`RustedMic.exe`).
+   - Linux: `RustedMic-0.3.1-linux-x64.tar.gz` (`RustedMic`). It needs ALSA,
+     GTK 3 and libudev at run time (present on most desktops), X11 or Wayland, and
      glibc 2.43 or newer (Ubuntu 26.04 or a similarly recent distro). On an
      older distro, build from source (see *Building (Linux)*).
 2. Run it. The setup screen scans for your Friday Night Funkin' installation, or
    lets you browse to it. It packs the assets into `assets.pak` (about 800 MB)
    next to the executable. This happens once.
-3. Play. Controls: WASD or arrow keys by default (rebind them under Options →
-   Controls).
+3. Play. Controls: WASD or arrow keys by default, or a gamepad's d-pad, sticks
+   and face buttons (rebind either under Options → Controls).
 4. Optional: put mods in the `mods` folder (see `mods/README.txt` and *Mods*
    below).
 
@@ -283,8 +300,8 @@ The C runtime is linked statically (`.cargo/config.toml`), so the resulting
 ## Building (Linux)
 
 Needs a C/C++ compiler (OpenH264 and libde265 are compiled from source), `pkg-config`, and the
-ALSA and GTK 3 development packages (for audio and the folder picker), e.g. on
-Debian/Ubuntu `sudo apt install build-essential pkg-config libasound2-dev libgtk-3-dev`.
+ALSA, GTK 3 and libudev development packages (for audio, the folder picker and gamepads), e.g. on
+Debian/Ubuntu `sudo apt install build-essential pkg-config libasound2-dev libgtk-3-dev libudev-dev`.
 
 ```sh
 cargo build --release
@@ -367,7 +384,7 @@ Deliberate differences, all aimed at determinism (see `play/mod.rs`):
 - Inputs carry their own song timestamp instead of "frame time minus measured latency".
 - Hit windows are refreshed before the input queue runs, so judgement doesn't depend on frame rate.
 
-Controls: WASD or arrow keys by default; rebind them under Options → Controls.
+Controls: WASD or arrow keys by default, or a gamepad; rebind them under Options → Controls.
 
 See *Known issues* above for what is not yet ported.
 

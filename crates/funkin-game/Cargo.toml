@@ -33,6 +33,7 @@ pollster = "1.0.3"
 cpal = "0.18.2"
 lewton = "0.10.2"
 fontdue = "0.9"
+ttf-parser = "0.25"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 serde_json.workspace = true
 dirs.workspace = true
@@ -44,6 +45,7 @@ matroska-demuxer = "0.8.1"
 rusty_vp9 = "0.3.0"
 de265-sys = { path = "../de265-sys" }
 symphonia = { version = "0.5.4", default-features = false, features = ["aac"] }
+gilrs = "0.11.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_SystemInformation"] }

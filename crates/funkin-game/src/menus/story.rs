@@ -533,15 +533,19 @@ impl StoryMenu {
         }
 
         if let Some(f) = vcr {
-            // Track list, centred text shifted left by a third of the screen.
+            // Track list, centred text shifted left by a third of the screen:
+            // 'TRACKS\n\n' + the songs' display names as written. Its y is
+            // `levelBackground.x + levelBackground.height + 100` (x, not y: 500).
             let mut lines = vec!["TRACKS".to_owned(), String::new()];
-            lines.extend(level.names.iter().map(|n| n.to_uppercase()));
+            // A long name's parentheticals go on their own lines, as the
+            // original shows "SPAGHETTI (feat. j-hope of BTS) (Clean ver.)".
+            lines.extend(level.names.iter().flat_map(|n| n.replace(" (", "\n(").lines().map(str::to_owned).collect::<Vec<_>>()));
             let widths: Vec<f32> = lines.iter().map(|s| f.width(gfx, s, 32.0)).collect();
             let w = widths.iter().cloned().fold(0.0, f32::max) + 4.0;
             let x = (VIEW_W - w) / 2.0 - VIEW_W * 0.33;
             let lh = f.line_height(32.0);
             for (i, s) in lines.iter().enumerate() {
-                f.draw(gfx, s, x + (w - 4.0 - widths[i]) / 2.0, BG_Y + BG_H + 100.0 + lh * i as f32, 32.0, TRACKS_COLOR);
+                f.draw(gfx, s, x + (w - 4.0 - widths[i]) / 2.0, BG_H + 100.0 + lh * i as f32, 32.0, TRACKS_COLOR);
             }
         }
 

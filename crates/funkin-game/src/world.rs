@@ -31,6 +31,9 @@ pub struct Character {
     pub death: funkin_core::stage::DeathData,
     /// Where the game over camera looks (`GameOverSubState.setCameraTarget`).
     pub death_focus: [f64; 2],
+    /// `Bopper.originalPosition`: where the stage put the character
+    /// (`resetPosition` returns it there).
+    pub original: [f32; 2],
 }
 
 fn dir_upper(d: NoteDirection) -> &'static str {
@@ -105,7 +108,8 @@ impl Character {
             focus[0] - data.camera_offsets[0].trunc() - slot.camera_offsets[0].trunc() + death.camera_offsets[0],
             focus[1] - data.camera_offsets[1].trunc() - slot.camera_offsets[1].trunc() + death.camera_offsets[1],
         ];
-        Ok(Self { actor, kind, sing_time_steps: data.sing_time, hold_timer: 0.0, focus, id: id.to_owned(), death, death_focus })
+        let original = [actor.x, actor.y];
+        Ok(Self { actor, kind, sing_time_steps: data.sing_time, hold_timer: 0.0, focus, id: id.to_owned(), death, death_focus, original })
     }
 
     fn is_singing(&self) -> bool {

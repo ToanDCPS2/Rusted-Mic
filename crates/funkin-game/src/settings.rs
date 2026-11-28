@@ -68,6 +68,9 @@ pub struct Settings {
     pub volume: i32,
     pub muted: bool,
     pub controls: Controls,
+    /// Gamepad bindings by save id (`Controls` holds them while running).
+    #[serde(rename = "gamepadControls")]
+    pub gamepad_controls: Option<BTreeMap<String, Vec<String>>>,
     /// Discord application id for Rich Presence (see `discord.rs`).
     pub discord_app_id: String,
 }
@@ -103,6 +106,7 @@ impl Default for Settings {
             volume: 10,
             muted: false,
             controls: Controls::default(),
+            gamepad_controls: None,
             discord_app_id: String::new(),
         }
     }
@@ -125,8 +129,11 @@ impl Settings {
     pub fn load() -> Self {
         let p = settings_path();
         match std::fs::read_to_string(&p) {
-            Ok(s) => serde_json::from_str::<Settings>(&s)
+            Ok(s) => serde_json::from_str::<Settings>(s.trim_start_matches('\u{feff}'))
                 .map(|mut s| {
+                    if let Some(m) = s.gamepad_controls.take() {
+                        s.controls.set_pad_ids(&m);
+                    }
                     s.controls.fill_missing();
                     s.clamp();
                     s
@@ -144,7 +151,9 @@ impl Settings {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        match serde_json::to_string_pretty(self) {
+        let mut out = self.clone();
+        out.gamepad_controls = Some(self.controls.pad_ids());
+        match serde_json::to_string_pretty(&out) {
             Ok(s) => {
                 // Write then rename, so a crash never leaves half a file.
                 let tmp = p.with_extension("json.tmp");
@@ -311,11 +320,16 @@ impl Control {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Controls {
     pub binds: BTreeMap<Control, Vec<KeyCode>>,
+    /// Gamepad bindings, as the key codes `pad.rs` gives each input.
+    pub pad: BTreeMap<Control, Vec<KeyCode>>,
 }
 
 impl Default for Controls {
     fn default() -> Self {
-        Self { binds: Control::ALL.iter().map(|&c| (c, c.defaults())).collect() }
+        Self {
+            binds: Control::ALL.iter().map(|&c| (c, c.defaults())).collect(),
+            pad: Control::ALL.iter().map(|&c| (c, crate::pad::defaults(c))).collect(),
+        }
     }
 }
 
@@ -336,7 +350,7 @@ impl<'de> Deserialize<'de> for Controls {
             let Ok(c) = serde_json::from_value::<Control>(serde_json::Value::String(name)) else { continue };
             binds.insert(c, keys.iter().filter_map(|k| key_from_id(k)).collect());
         }
-        let mut c = Controls { binds };
+        let mut c = Controls { binds, pad: BTreeMap::new() };
         c.fill_missing();
         Ok(c)
     }
@@ -346,6 +360,7 @@ impl Controls {
     fn fill_missing(&mut self) {
         for c in Control::ALL {
             self.binds.entry(c).or_insert_with(|| c.defaults());
+            self.pad.entry(c).or_insert_with(|| crate::pad::defaults(c));
         }
     }
 
@@ -353,8 +368,39 @@ impl Controls {
         self.binds.get(&c).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    pub fn pad_keys(&self, c: Control) -> &[KeyCode] {
+        self.pad.get(&c).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Keyboard (`gamepad` false) or gamepad bindings.
+    pub fn device(&mut self, gamepad: bool) -> &mut BTreeMap<Control, Vec<KeyCode>> {
+        if gamepad { &mut self.pad } else { &mut self.binds }
+    }
+
     pub fn is(&self, c: Control, code: KeyCode) -> bool {
-        self.keys(c).contains(&code)
+        if crate::pad::is_pad(code) {
+            self.pad_keys(c).contains(&code)
+        } else {
+            self.keys(c).contains(&code)
+        }
+    }
+
+    /// Gamepad bindings by save id, for the settings file.
+    pub fn pad_ids(&self) -> BTreeMap<String, Vec<String>> {
+        self.pad
+            .iter()
+            .filter_map(|(c, keys)| {
+                let name = serde_json::to_value(c).ok()?.as_str()?.to_owned();
+                Some((name, keys.iter().filter_map(|&k| crate::pad::pad_id(k)).map(str::to_owned).collect()))
+            })
+            .collect()
+    }
+
+    pub fn set_pad_ids(&mut self, m: &BTreeMap<String, Vec<String>>) {
+        for (name, ids) in m {
+            let Ok(c) = serde_json::from_value::<Control>(serde_json::Value::String(name.clone())) else { continue };
+            self.pad.insert(c, ids.iter().filter_map(|i| crate::pad::pad_from_id(i)).collect());
+        }
     }
 
     /// The note lane a key plays, if any.
@@ -434,8 +480,11 @@ pub fn key_from_id(id: &str) -> Option<KeyCode> {
     KEYS.iter().find(|(_, i, _)| i.eq_ignore_ascii_case(id)).map(|(k, _, _)| *k)
 }
 
-/// How a key is shown in the controls menu (`InputFormatter`).
+/// How a key (or gamepad input) is shown in the controls menu (`InputFormatter`).
 pub fn key_label(code: KeyCode) -> &'static str {
+    if let Some(l) = crate::pad::pad_label(code) {
+        return l;
+    }
     KEYS.iter().find(|(k, _, _)| *k == code).map(|(_, _, l)| *l).unwrap_or("?")
 }
 
@@ -450,8 +499,26 @@ mod tests {
         s.middlescroll = true;
         let j = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.controls, s.controls);
+        assert_eq!(back.controls.binds, s.controls.binds);
         assert!(back.middlescroll);
+    }
+
+    #[test]
+    fn gamepad_binds_round_trip() {
+        let mut c = Controls::default();
+        let a = crate::pad::pad_from_id("A").unwrap();
+        assert!(c.is(Control::Accept, a) && c.is(Control::NoteDown, a));
+        assert_eq!(c.menu_key(a), Some(KeyCode::Enter));
+        assert_eq!(c.note_lane(a), Some(1));
+        c.pad.insert(Control::Pause, vec![a]);
+        let ids = c.pad_ids();
+        let mut back = Controls::default();
+        back.set_pad_ids(&ids);
+        assert_eq!(back.pad, c.pad);
+        // A pad code never matches a keyboard binding, and the other way round.
+        c.binds.insert(Control::Reset, vec![a]);
+        c.pad.insert(Control::Reset, vec![]);
+        assert!(!c.is(Control::Reset, a));
     }
 
     #[test]

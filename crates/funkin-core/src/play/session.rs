@@ -309,6 +309,7 @@ impl PlaySession {
         let judgement = scoring::judge_note(diff as f64, self.config.scoring);
 
         self.player.hit_note(idx, pos);
+        self.player.notes[idx].kept = judgement.is_combo_break();
         let note = &self.player.notes[idx];
         let (direction, scoreable) = (note.direction, note.flags.scoreable);
         if scoreable {

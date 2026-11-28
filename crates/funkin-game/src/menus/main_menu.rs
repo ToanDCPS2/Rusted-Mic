@@ -8,12 +8,17 @@ use winit::keyboard::KeyCode;
 use crate::actor::Actor;
 use crate::assets::Assets;
 use crate::audio::{Audio, Pcm};
+use crate::gfx::ttf::TtfFont;
 use crate::gfx::{Gfx, VIEW_H, VIEW_W};
 
 use super::{anim, flicker_visible, follow_lerp, screen_camera, MenuAction, Tween};
 
 const ITEMS: [&str; 5] = ["storymode", "freeplay", "merch", "options", "credits"];
 const SPACING: f32 = 160.0;
+/// `MenuTypedList`: the picked item flickers this long before its callback.
+const FLICKER: f32 = 1.0;
+/// `startExitState`: the other items fade out this long before the switch.
+const EXIT_FADE: f32 = 0.4;
 /// `Constants.URL_MERCH_FALLBACK` (the Newgrounds referral isn't available).
 const URL_MERCH: &str = "https://needlejuicerecords.com/en-ca/pages/friday-night-funkin";
 
@@ -145,11 +150,11 @@ impl MainMenu {
             }
         };
         match code {
-            KeyCode::ArrowUp | KeyCode::KeyW => {
+            KeyCode::ArrowUp => {
                 self.select((self.selected + n - 1) % n);
                 sfx(&self.scroll_sfx, 0.4);
             }
-            KeyCode::ArrowDown | KeyCode::KeyS => {
+            KeyCode::ArrowDown => {
                 self.select((self.selected + 1) % n);
                 sfx(&self.scroll_sfx, 0.4);
             }
@@ -157,14 +162,6 @@ impl MainMenu {
                 if matches!(ITEMS[self.selected], "storymode" | "freeplay" | "options" | "merch" | "credits") {
                     sfx(&self.confirm_sfx, 1.0);
                     self.accepted_at = Some(self.time);
-                    if matches!(ITEMS[self.selected], "storymode" | "options" | "credits") {
-                        // startExitState: the other items fade out.
-                        for (i, f) in self.fades.iter_mut().enumerate() {
-                            if i != self.selected {
-                                *f = Tween::new(1.0, 0.0, self.time, 0.4, "quadOut");
-                            }
-                        }
-                    }
                 }
             }
             KeyCode::Escape | KeyCode::Backspace => {
@@ -186,7 +183,17 @@ impl MainMenu {
             let e = self.time - at;
             // FlxFlicker.flicker(magenta, 1.1, 0.15, false, true)
             self.magenta.visible = self.flashing_lights && e < 1.1 && flicker_visible(e, 0.15);
-            if e >= 1.0 && !self.covered {
+            let exits = matches!(ITEMS[self.selected], "storymode" | "options" | "credits");
+            if exits && e >= FLICKER && self.fades[self.selected].at(self.time) > 0.0 {
+                // startExitState: the others fade out, the picked one hides,
+                // and the state switches when the fade ends.
+                let start = at + FLICKER;
+                for (i, f) in self.fades.iter_mut().enumerate() {
+                    *f = if i == self.selected { Tween::hold(0.0) } else { Tween::new(1.0, 0.0, start, EXIT_FADE, "quadOut") };
+                }
+            }
+            let switch_at = if exits { FLICKER + EXIT_FADE } else { FLICKER };
+            if e >= switch_at && !self.covered {
                 if ITEMS[self.selected] == "merch" {
                     // selectMerch: open the store, then back to idle.
                     open_url(URL_MERCH);
@@ -207,7 +214,7 @@ impl MainMenu {
         MenuAction::None
     }
 
-    pub fn draw(&self, gfx: &mut Gfx) {
+    pub fn draw(&self, gfx: &mut Gfx, vcr: Option<&TtfFont>) {
         gfx.begin([0.0, 0.0, 0.0, 1.0]);
         let cam = screen_camera(0.0, self.scroll_y);
         self.bg.draw(gfx, &cam);
@@ -216,11 +223,15 @@ impl MainMenu {
             // Item flickers (1 s, 0.06 s) while being accepted.
             if let Some(at) = self.accepted_at {
                 let e = self.time - at;
-                if i == self.selected && e < 1.0 && !flicker_visible(e, 0.06) {
+                if i == self.selected && e < FLICKER && !flicker_visible(e, 0.06) {
                     continue;
                 }
             }
             a.draw_alpha(gfx, &cam, self.fades[i].at(self.time));
+        }
+        // leftWatermarkText: `Constants.VERSION` at (0, height - 18), VCR 16 outlined.
+        if let Some(v) = vcr {
+            crate::menus::options::draw_outlined_alpha(gfx, v, concat!("v", env!("CARGO_PKG_VERSION")), 0.0, VIEW_H - 18.0, 16.0, 1.0, 1.0);
         }
     }
 }

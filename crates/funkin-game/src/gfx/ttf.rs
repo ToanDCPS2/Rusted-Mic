@@ -22,19 +22,32 @@ struct Glyph {
 
 pub struct TtfFont {
     font: fontdue::Font,
+    /// Line pitch per em (see [`Self::load`]).
+    em: Option<f32>,
     glyphs: RefCell<HashMap<(char, u32), Glyph>>,
 }
 
 impl TtfFont {
     pub fn load(path: &Path) -> Result<Self, String> {
         let bytes = funkin_core::vfs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // The line pitch per em. OpenFL spaces lines `Math.ceil(ascent +
+        // descent)` apart; measured against the original, VCR OSD Mono at 32
+        // sits 29 px apart, which is ascent + descent less the font's line gap.
+        let em = ttf_parser::Face::parse(&bytes, 0).ok().map(|f| {
+            let upm = f.units_per_em().max(1) as f32;
+            (f.ascender() as f32 - f.descender() as f32 - f.line_gap() as f32).max(0.0) / upm
+        });
         let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Self { font, glyphs: RefCell::new(HashMap::new()) })
+        Ok(Self { font, em, glyphs: RefCell::new(HashMap::new()) })
     }
 
-    /// Height of one line (ascent + descent + gap), as OpenFL spaces lines.
+    /// Height of one line, as the original spaces lines (rounded up, as
+    /// OpenFL's TextEngine does).
     pub fn line_height(&self, size: f32) -> f32 {
-        self.font.horizontal_line_metrics(size).map(|m| m.new_line_size).unwrap_or(size * 1.15)
+        match self.em {
+            Some(e) if e > 0.0 => (e * size).ceil(),
+            _ => self.font.horizontal_line_metrics(size).map(|m| m.new_line_size).unwrap_or(size * 1.15),
+        }
     }
 
     /// `FlxText.height` for `lines` lines: the text plus the 2 px gutters.

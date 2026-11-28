@@ -75,6 +75,9 @@ pub struct PlayNote {
     pub handled_miss: bool,
     pub may_hit: bool,
     pub too_early: bool,
+    /// Hit with a combo break (bad/shit): `hitNote(note, false)` keeps the
+    /// sprite scrolling, half see-through and desaturated.
+    pub kept: bool,
     pub hold: Option<HoldState>,
 }
 
@@ -106,6 +109,7 @@ impl PlayNote {
             handled_miss: false,
             may_hit: false,
             too_early: false,
+            kept: false,
             hold,
         }
     }

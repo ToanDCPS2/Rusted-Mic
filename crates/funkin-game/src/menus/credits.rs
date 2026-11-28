@@ -76,11 +76,53 @@ pub struct Credits {
     exiting: bool,
 }
 
-/// The system monospace font the original asks for (`Consolas` on Windows).
+/// The system monospace font the original asks for: `Consolas` on Windows,
+/// `Courier New` elsewhere (falling back to the usual Linux monospace fonts).
 fn system_font(bold: bool) -> Option<TtfFont> {
-    let windir = std::env::var_os("WINDIR").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Windows".into());
-    let name = if bold { "consolab.ttf" } else { "consola.ttf" };
-    TtfFont::load(&windir.join("Fonts").join(name)).ok()
+    use std::path::PathBuf;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        let windir = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
+        paths.push(windir.join("Fonts").join(if bold { "consolab.ttf" } else { "consola.ttf" }));
+    }
+    #[cfg(not(windows))]
+    {
+        let names: &[&str] = if bold {
+            &["Courier_New_Bold.ttf", "courbd.ttf", "DejaVuSansMono-Bold.ttf", "LiberationMono-Bold.ttf", "NotoSansMono-Bold.ttf", "UbuntuMono-B.ttf"]
+        } else {
+            &["Courier_New.ttf", "cour.ttf", "DejaVuSansMono.ttf", "LiberationMono-Regular.ttf", "NotoSansMono-Regular.ttf", "UbuntuMono-R.ttf"]
+        };
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(&home).join(".local/share/fonts"));
+            dirs.push(PathBuf::from(&home).join(".fonts"));
+        }
+        dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(PathBuf::from));
+        for name in names {
+            for d in &dirs {
+                if let Some(p) = find_file(d, name, 4) {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    paths.iter().find_map(|p| TtfFont::load(p).ok())
+}
+
+/// `name` anywhere under `dir`, at most `depth` folders down.
+#[cfg(not(windows))]
+fn find_file(dir: &std::path::Path, name: &str, depth: u32) -> Option<std::path::PathBuf> {
+    let direct = dir.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let mut subs: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    subs.sort();
+    subs.iter().find_map(|d| find_file(d, name, depth - 1))
 }
 
 /// Greedy word wrap to `width` px (`FlxText.fieldWidth` minus its gutters).

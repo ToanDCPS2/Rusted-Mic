@@ -53,6 +53,11 @@ pub struct HealthIcon {
     width: f32,
     /// Bop tween: (from, elapsed, duration).
     bop: Option<(f32, f32, f32)>,
+    /// `bopEvery` (steps; 0 = never) and `bopAngle` (degrees), set by scripts.
+    pub bop_every: i64,
+    pub bop_angle: f32,
+    /// `angle`: a bop's tilt, easing back to 0.
+    angle: f32,
     state: State,
     /// The icon's most common colour (Psych Engine's `CoolUtil.dominantColor`),
     /// used for the Psych Engine health bar.
@@ -119,6 +124,11 @@ fn icon_data(assets: &Assets, character: &str) -> IconData {
 }
 
 impl IconData {
+    /// `toggleOldIcon`'s `bf-old`.
+    pub fn old_bf() -> Self {
+        Self { id: "bf-old".into(), scale: 1.0, flip_x: false, is_pixel: false, offsets: [0.0, 0.0], should_bop: true }
+    }
+
     /// `SetHealthIconSongEvent`'s value (`id`, `scale`, `flipX`, `isPixel`, `offsetX/Y`, `shouldBop`).
     pub fn from_event(v: &serde_json::Map<String, serde_json::Value>) -> Self {
         let f = |k: &str, d: f64| v.get(k).and_then(|x| x.as_f64()).unwrap_or(d) as f32;
@@ -171,8 +181,12 @@ impl HealthIcon {
                             offset: d.offsets,
                             should_bop: d.should_bop,
                             player,
-                            width: ICON_SIZE * d.scale,
+                            // snapToTargetSize: a tall icon is sized by its height.
+                            width: if fw > fh { ICON_SIZE * d.scale } else { (ICON_SIZE * d.scale * fw / fh).floor() },
                             bop: None,
+                            bop_every: 4,
+                            bop_angle: 0.0,
+                            angle: 0.0,
                             state: State::Idle,
                             color: dominant_color(&p, fw.min(fh) as u32),
                         });
@@ -209,6 +223,9 @@ impl HealthIcon {
             player,
             width: ICON_SIZE * d.scale,
             bop: None,
+            bop_every: 4,
+            bop_angle: 0.0,
+            angle: 0.0,
             state: State::Idle,
             color,
         })
@@ -221,9 +238,10 @@ impl HealthIcon {
     /// `onStepHit`: bop every beat.
     /// `bop_scale`: `HealthIcon.BOP_SCALE` (a script may change it).
     pub fn on_step(&mut self, step: i64, step_ms: f64, bop_scale: Option<f32>) {
-        if !self.should_bop || step.rem_euclid(4) != 0 {
+        if self.bop_every == 0 || !self.should_bop || step.rem_euclid(self.bop_every) != 0 {
             return;
         }
+        self.angle += self.bop_angle * if self.player { 1.0 } else { -1.0 };
         let from = self.width + self.base_width() * bop_scale.unwrap_or(BOP_SCALE);
         self.width = from.floor();
         self.bop = Some((from, 0.0, (step_ms as f32 * 0.002).min(0.175)));
@@ -232,6 +250,10 @@ impl HealthIcon {
     /// `update` / `updateHealthIcon`: tween the bop and pick the face.
     /// `auto_update` off (a script's `autoUpdate = false`): the face stays as set.
     pub fn update(&mut self, dt: f32, health: f64, auto_update: bool) {
+        // MathUtil.smoothLerpPrecision(angle, 0, elapsed, HEALTH_ICON_ANGLE_HALF_LIFE).
+        if self.bop_every != 0 && self.angle != 0.0 && dt > 0.0 {
+            self.angle *= 0.01f32.powf(dt / 0.512);
+        }
         let base = self.base_width();
         if let Some((from, t, dur)) = &mut self.bop {
             *t += dt;
@@ -322,11 +344,18 @@ impl HealthIcon {
     pub fn draw_at(&self, gfx: &mut Gfx, x: f32, y: f32, alpha: f32, flip: Option<bool>) {
         let scale = self.width / self.frame;
         let (w, h) = (self.width, self.frame_h * scale);
+        // `angle` turns the sprite about its centre.
+        let spin = |m: Affine| -> Affine {
+            if self.angle == 0.0 {
+                return m;
+            }
+            Affine::translate(x + w / 2.0, y + h / 2.0).then(&Affine::rotate_deg(self.angle)).then(&Affine::translate(-x - w / 2.0, -y - h / 2.0)).then(&m)
+        };
         if let Some(sh) = &self.sheet {
             let looped = LOOPS.contains(&sh.cur);
             let anim = sh.anims.get(sh.cur).or_else(|| sh.anims.get(Self::loop_name(self.state))).or_else(|| sh.anims.get("idle"));
             if let Some(f) = anim.and_then(|a| a.frame_at(sh.t, 24.0, looped).or_else(|| a.frames.last().copied())) {
-                let m = Affine::translate(x, y).then(&Affine::scale(scale, scale));
+                let m = spin(Affine::translate(x, y).then(&Affine::scale(scale, scale)));
                 sh.atlas.draw_xf(gfx, f, &m, flip.unwrap_or(self.flip), [1.0, 1.0, 1.0, alpha]);
             }
             return;
@@ -339,6 +368,8 @@ impl HealthIcon {
         .min(self.frames - 1);
         let src = [(i % self.cols) as f32 * self.frame, (i / self.cols) as f32 * self.frame, self.frame, self.frame];
         let (x0, x1) = if flip.unwrap_or(self.flip) { (x + w, x) } else { (x, x + w) };
-        gfx.quad(self.tex, src, [[x0, y], [x1, y], [x1, y + h], [x0, y + h]], [1.0, 1.0, 1.0, alpha]);
+        let m = spin(Affine::IDENTITY);
+        let p = |px: f32, py: f32| m.apply([px, py]);
+        gfx.quad(self.tex, src, [p(x0, y), p(x1, y), p(x1, y + h), p(x0, y + h)], [1.0, 1.0, 1.0, alpha]);
     }
 }

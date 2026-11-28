@@ -105,6 +105,10 @@ pub struct NoteSkin {
     pub ratings: [TexId; 4],
     pub rating_sizes: [(f32, f32); 4],
     pub rating_scale: f32,
+    /// `getJudgementSpriteOffsets` per rating (sick, good, bad, shit).
+    pub rating_off: [[f32; 2]; 4],
+    /// `getComboNumSpriteOffsets` per digit.
+    pub digit_off: [[f32; 2]; 10],
     pub digits: [TexId; 10],
     pub digit_scale: f32,
     /// Popups fade in two steps (`EaseUtil.stepped(2)`).
@@ -112,6 +116,8 @@ pub struct NoteSkin {
     pub health_bar: TexId,
     pub countdown: [Option<TexId>; 3],
     pub countdown_scale: f32,
+    /// `getCountdownSpriteOffsets` for ready, set, go.
+    pub countdown_off: [[f32; 2]; 3],
     /// The countdown fades in eight steps instead of `cubeInOut`.
     pub countdown_pixel: bool,
     pub countdown_sfx: [Option<Arc<Pcm>>; 4],
@@ -304,12 +310,15 @@ impl NoteSkin {
             ratings,
             rating_sizes,
             rating_scale: style.scale("judgementSick"),
+            rating_off: ["judgementSick", "judgementGood", "judgementBad", "judgementShit"].map(|k| style.offsets(k)),
+            digit_off: std::array::from_fn(|i| style.offsets(&format!("comboNumber{i}"))),
             digits,
             digit_scale: style.scale("comboNumber0"),
             popup_pixel: style.is_pixel("judgementSick"),
             health_bar: a.texture(gfx, "shared:healthBar")?,
             countdown,
             countdown_scale: style.scale("countdownGo"),
+            countdown_off: [steps[1], steps[2], steps[3]].map(|k| style.offsets(k)),
             countdown_pixel: style.is_pixel("countdownGo"),
             countdown_sfx,
             miss_sfx: (1..=3).filter_map(|i| a.sound(&format!("shared:missnote{i}"))).collect(),

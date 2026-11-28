@@ -17,6 +17,7 @@
 mod actor;
 mod app;
 mod assets;
+mod hud_scan;
 mod audio;
 mod game_over;
 mod gfx;
@@ -28,6 +29,7 @@ mod notestyle;
 mod setup_screen;
 mod discord;
 mod overlay;
+mod pad;
 mod pause;
 mod results;
 mod play;
