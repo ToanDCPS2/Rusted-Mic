@@ -1,9 +1,11 @@
 //! Port of `CreditsState`: the credits scroll.
 //!
 //! The base game builds its credits into `Funkin.exe` at compile time
-//! (`HARDCODED_CREDITS`), so they aren't in the assets. Like a non-hardcoded
-//! build, this reads `data/credits.json` (the same format, so mods can add
-//! one), and falls back to `CreditsDataHandler.getFallback()`.
+//! (`HARDCODED_CREDITS`), so they aren't in the assets: setup recovers them
+//! from the user's executable as `data/credits.json` (see
+//! `funkin_assets::credits`). Like a non-hardcoded build, this reads that file
+//! (the same format, so mods can replace it), and falls back to
+//! `CreditsDataHandler.getFallback()`.
 
 use serde::Deserialize;
 use winit::keyboard::KeyCode;

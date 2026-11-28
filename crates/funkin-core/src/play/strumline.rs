@@ -138,7 +138,8 @@ impl Strumline {
     }
 
     /// Port of the hold-note section of `Strumline.updateNotes`.
-    pub fn update_holds(&mut self, song_position: f64, out: &mut Vec<HoldUpdate>) {
+    /// `controlled` is false for botplay: holds then play out without a key held.
+    pub fn update_holds(&mut self, song_position: f64, controlled: bool, out: &mut Vec<HoldUpdate>) {
         for i in self.active_range(song_position) {
             let strum = self.notes[i].strum_time();
             let dir = self.notes[i].direction;
@@ -151,7 +152,7 @@ impl Strumline {
                 continue;
             }
             if song_position > strum && h.hit_note && !h.missed_note {
-                if is_player && !held {
+                if is_player && controlled && !held {
                     h.missed_note = true;
                     out.push(HoldUpdate::Released(i));
                     continue;

@@ -9,6 +9,7 @@ use crate::gfx::atlas::Atlas;
 use crate::gfx::text::Font;
 use crate::gfx::{Gfx, TexId};
 
+#[derive(Clone)]
 pub struct Assets {
     pub root: PathBuf,
 }

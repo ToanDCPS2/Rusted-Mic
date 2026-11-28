@@ -23,7 +23,7 @@ pub struct Character {
     pub actor: Actor,
     pub kind: CharType,
     sing_time_steps: f64,
-    hold_timer: f64,
+    pub(crate) hold_timer: f64,
     pub focus: [f64; 2],
     /// The character id (`characterId`).
     pub id: String,
@@ -40,6 +40,24 @@ fn dir_upper(d: NoteDirection) -> &'static str {
         NoteDirection::Up => "UP",
         NoteDirection::Right => "RIGHT",
     }
+}
+
+/// `CharacterDataParser.fetchCharacter(id)`: a character on its own, not in a
+/// stage slot (scripts place it), scaled and flipped by its data and in its idle.
+pub fn character_actor(gfx: &mut Gfx, assets: &Assets, id: &str) -> Result<Actor, String> {
+    let data = load_character(&assets.root, id).map_err(|e| e.to_string())?;
+    let mut actor = Actor::animated(gfx, assets, id, &data.render_type, &data.asset_path, None, &data.animations, !data.is_pixel)?;
+    actor.should_bop = false;
+    actor.char_dance = true;
+    actor.set_swf_mode(true);
+    actor.dance_every = data.dance_every;
+    actor.global_offsets = [data.offsets[0] as f32, data.offsets[1] as f32];
+    actor.flip_x = data.flip_x;
+    actor.bop(true);
+    actor.update_hitbox();
+    let s = data.scale as f32;
+    actor.scale = [s, s];
+    Ok(actor)
 }
 
 impl Character {
@@ -113,6 +131,27 @@ impl Character {
         let name = format!("sing{}{}", dir_upper(dir), if miss { "miss" } else { "" });
         self.actor.play(&name, true, false);
         self.hold_timer = 0.0;
+    }
+
+    /// `BaseCharacter.playSingAnimation(dir, miss, suffix)`.
+    pub fn sing_suffix(&mut self, dir: NoteDirection, miss: bool, suffix: &str) {
+        let suffix = if suffix.is_empty() { String::new() } else { format!("-{suffix}") };
+        let name = format!("sing{}{}{suffix}", dir_upper(dir), if miss { "miss" } else { "" });
+        self.actor.play(&name, true, false);
+        self.hold_timer = 0.0;
+    }
+
+    /// `BaseCharacter.onNoteHit` / `onNoteMiss` (also ghost misses, `must_hit` true):
+    /// the player's notes make BF sing, the opponent's the dad.
+    pub fn on_note(&mut self, hit: bool, must_hit: bool, dir: NoteDirection, kind: &str) {
+        let mine = match self.kind {
+            CharType::Bf => must_hit,
+            CharType::Dad => !must_hit,
+            CharType::Gf => false,
+        };
+        if mine && !(hit && kind == "noanim") {
+            self.sing(dir, !hit);
+        }
     }
 
     pub fn on_step(&mut self, step: i64) {
@@ -244,12 +283,61 @@ impl ABot {
 enum Slot {
     Prop(usize),
     Char(usize),
+    Trail(usize),
+}
+
+/// `FunkTrail` / `FlxTrail`: fading copies of a character's recent frames
+/// (Spirit's `evilTrail`), made by a script and drawn once `add`ed.
+struct Trail {
+    /// Index into `chars`.
+    owner: usize,
+    z: i32,
+    /// Seconds between saved frames.
+    delay: f32,
+    length: usize,
+    alpha: f32,
+    diff: f32,
+    timer: f32,
+    /// Newest first.
+    poses: std::collections::VecDeque<crate::actor::Pose>,
+}
+
+/// A script's `FlxCamera`: its own scroll and zoom (the script usually copies
+/// `camGame`'s), optionally following the game's follow point.
+pub(crate) struct ExtraCam {
+    pub cam: GameCamera,
+    /// `follow(point, LOCKON, lerp)`: track `camGame`'s follow point.
+    pub follow: Option<f64>,
+    pub alpha: f32,
+    pub visible: bool,
+}
+
+impl ExtraCam {
+    pub fn new(w: f64, h: f64, zoom: f64) -> Self {
+        Self { cam: GameCamera::new(zoom, w, h), follow: None, alpha: 1.0, visible: true }
+    }
+}
+
+/// A character a script fetched (a prop) and gave a `characterType`: it sings
+/// that side's notes like a `BaseCharacter`.
+pub(crate) struct PropSinger {
+    pub prop: usize,
+    pub kind: CharType,
+    hold: f64,
+    sing_steps: f64,
 }
 
 pub struct World {
     #[allow(dead_code)]
     pub stage: StageData,
-    props: Vec<Actor>,
+    pub(crate) props: Vec<Actor>,
+    /// Props a script put on a camera other than `camGame`, with the camera:
+    /// 1 `camHUD`, 2 `camCutscene`, 3+ a script's own `FlxCamera` (see `extra_cams`).
+    pub(crate) screen: Vec<(usize, u64)>,
+    /// Cameras scripts made (`new FlxCamera()`), camera id `3 + index`.
+    pub(crate) extra_cams: Vec<ExtraCam>,
+    /// `FlxG.cameras.list` order by camera id (0 game, 1 HUD, 2 cutscene, 3+ extra).
+    pub(crate) cam_order: Vec<u64>,
     /// Indexed by `CharType as usize` order: bf, dad, gf.
     pub chars: [Option<Character>; 3],
     order: Vec<Slot>,
@@ -257,6 +345,8 @@ pub struct World {
     abot: Option<ABot>,
     /// Camera bops on the beat (`Preferences.zoomCamera`).
     pub zoom_camera: bool,
+    trails: Vec<Trail>,
+    pub(crate) singers: Vec<PropSinger>,
 }
 
 fn parse_color(s: &str) -> Option<[f32; 4]> {
@@ -278,11 +368,7 @@ impl World {
                 let c = parse_color(&p.asset_path).unwrap_or([0.0, 0.0, 0.0, 1.0]);
                 Ok(Actor::solid(&p.name, c, p.scale[0].trunc() as f32, p.scale[1].trunc() as f32))
             } else if !p.animations.is_empty() {
-                if p.anim_type == "packer" {
-                    Err("packer atlases are not supported yet".to_owned())
-                } else {
-                    Actor::animated(gfx, assets, &p.name, &p.anim_type, &p.asset_path, level, &p.animations, smooth)
-                }
+                Actor::animated(gfx, assets, &p.name, &p.anim_type, &p.asset_path, level, &p.animations, smooth)
             } else {
                 Actor::image(gfx, assets, &p.name, &p.asset_path, level, smooth)
             };
@@ -306,6 +392,7 @@ impl World {
             a.angle = p.angle as f32;
             a.z_index = p.z_index;
             a.flip_x = p.flip_x;
+            a.apply_stage_matrix = p.atlas_settings.apply_stage_matrix;
             a.dance_every = p.dance_every;
             if let Some(s) = &p.starting_animation {
                 a.play(s, false, false);
@@ -353,7 +440,116 @@ impl World {
         }
         camera.snap();
 
-        Ok(Self { stage, props, chars, order: order.into_iter().map(|(_, s)| s).collect(), camera, abot, zoom_camera: true })
+        Ok(Self { stage, props, screen: Vec::new(), extra_cams: Vec::new(), cam_order: vec![0, 1, 2], chars, order: order.into_iter().map(|(_, s)| s).collect(), camera, abot, zoom_camera: true, trails: Vec::new(), singers: Vec::new() })
+    }
+
+    /// No stage: a container for sprites outside a song (the results screen).
+    pub fn empty() -> Self {
+        let stage: StageData = serde_json::from_value(serde_json::json!({})).expect("empty stage data");
+        Self {
+            stage,
+            props: Vec::new(),
+            screen: Vec::new(),
+            extra_cams: Vec::new(),
+            cam_order: vec![0, 1, 2],
+            chars: [None, None, None],
+            order: Vec::new(),
+            camera: GameCamera::new(1.0, 1280.0, 720.0),
+            abot: None,
+            zoom_camera: false,
+            trails: Vec::new(),
+            singers: Vec::new(),
+        }
+    }
+
+    /// `Stage.refresh`: re-sort by zIndex (stable, so equal ones keep their order).
+    pub fn refresh(&mut self) {
+        let z = |s: &Slot, w: &World| match s {
+            Slot::Prop(i) => w.props[*i].z_index,
+            Slot::Char(i) => w.chars[*i].as_ref().map(|c| c.actor.z_index).unwrap_or(0),
+            Slot::Trail(i) => w.trails[*i].z,
+        };
+        let mut order = std::mem::take(&mut self.order);
+        order.sort_by_key(|s| z(s, self));
+        self.order = order;
+    }
+
+    /// A sprite a script made (`new FlxSprite()`): it isn't drawn until added.
+    pub fn new_prop(&mut self, a: Actor) -> usize {
+        self.props.push(a);
+        self.props.len() - 1
+    }
+
+    /// `new FunkTrail(character, null, length, delay, alpha, diff)`: drawn once
+    /// [`World::show_trail`] adds it.
+    pub fn new_trail(&mut self, owner: usize, length: usize, delay: f32, alpha: f32, diff: f32) -> usize {
+        let z = self.chars.get(owner).and_then(Option::as_ref).map_or(0, |c| c.actor.z_index);
+        self.trails.push(Trail { owner, z, delay, length, alpha, diff, timer: 0.0, poses: Default::default() });
+        self.trails.len() - 1
+    }
+
+    pub fn trail_z(&self, i: usize) -> Option<i32> {
+        self.trails.get(i).map(|t| t.z)
+    }
+
+    pub fn set_trail_z(&mut self, i: usize, z: i32) {
+        if let Some(t) = self.trails.get_mut(i) {
+            t.z = z;
+            self.refresh();
+        }
+    }
+
+    /// `add(trail)` / `remove(trail)`.
+    pub fn show_trail(&mut self, i: usize, show: bool) {
+        let listed = self.order.iter().any(|s| matches!(s, Slot::Trail(j) if *j == i));
+        if show && !listed && i < self.trails.len() {
+            self.order.push(Slot::Trail(i));
+            self.refresh();
+        } else if !show {
+            self.order.retain(|s| !matches!(s, Slot::Trail(j) if *j == i));
+        }
+    }
+
+    /// `add(sprite)`: draw a script-made prop (sorted in by zIndex).
+    pub fn add_prop(&mut self, i: usize) {
+        if i < self.props.len() && !self.order.iter().any(|s| matches!(s, Slot::Prop(j) if *j == i)) {
+            self.order.push(Slot::Prop(i));
+            self.refresh();
+        }
+    }
+
+    /// `remove(sprite)`.
+    pub fn remove_prop(&mut self, i: usize) {
+        self.order.retain(|s| !matches!(s, Slot::Prop(j) if *j == i));
+    }
+
+    /// `character.characterType = t` on a fetched character.
+    pub fn set_singer(&mut self, prop: usize, kind: CharType, sing_steps: f64) {
+        match self.singers.iter_mut().find(|s| s.prop == prop) {
+            Some(s) => s.kind = kind,
+            None => self.singers.push(PropSinger { prop, kind, hold: 0.0, sing_steps }),
+        }
+    }
+
+    /// A fetched character's `characterType` (OTHER until a script sets one).
+    pub fn singer_kind(&self, prop: usize) -> Option<CharType> {
+        self.singers.iter().find(|s| s.prop == prop).map(|s| s.kind)
+    }
+
+    /// Note hits and misses for [`PropSinger`]s (`BaseCharacter.onNoteHit`).
+    pub fn singers_note(&mut self, hit: bool, must_hit: bool, dir: NoteDirection, kind: &str) {
+        for s in &mut self.singers {
+            let mine = match s.kind {
+                CharType::Bf => must_hit,
+                CharType::Dad => !must_hit,
+                CharType::Gf => false,
+            };
+            let Some(a) = self.props.get_mut(s.prop) else { continue };
+            if mine && a.visible && !(hit && kind == "noanim") {
+                a.play(&format!("sing{}{}", dir_upper(dir), if hit { "" } else { "miss" }), true, false);
+                s.hold = 0.0;
+            }
+        }
     }
 
     pub fn char_mut(&mut self, kind: CharType) -> Option<&mut Character> {
@@ -396,8 +592,43 @@ impl World {
 
     pub fn update(&mut self, elapsed: f64, step_ms: f64, holding: [bool; 2], keys_held: bool) {
         self.camera.update(elapsed);
+        for c in &mut self.extra_cams {
+            if let Some(rate) = c.follow {
+                c.cam.follow_point = self.camera.follow_point;
+                c.cam.update_follow(elapsed, rate);
+            }
+            c.cam.update_shake(elapsed);
+        }
         for p in &mut self.props {
             p.update(elapsed as f32);
+        }
+        for s in &mut self.singers {
+            let Some(a) = self.props.get(s.prop) else { continue };
+            let cur = a.current();
+            if !(cur.starts_with("sing") && !cur.ends_with("-end")) {
+                s.hold = 0.0;
+                continue;
+            }
+            s.hold += elapsed;
+            let mut sec = s.sing_steps * step_ms / 1000.0;
+            if cur.ends_with("miss") {
+                sec *= 2.0;
+            }
+            let held = match s.kind {
+                CharType::Bf => holding[0] || keys_held,
+                CharType::Dad => holding[1],
+                CharType::Gf => false,
+            };
+            if s.hold > sec && !held {
+                s.hold = 0.0;
+                let end = format!("{}-end", cur.strip_suffix("-hold").unwrap_or(cur));
+                let a = &mut self.props[s.prop];
+                if a.has_anim(&end) {
+                    a.play(&end, false, false);
+                } else {
+                    a.bop(false);
+                }
+            }
         }
         for c in self.chars.iter_mut().flatten() {
             let h = match c.kind {
@@ -406,6 +637,17 @@ impl World {
                 CharType::Gf => false,
             };
             c.update(elapsed, step_ms, h, keys_held && c.kind == CharType::Bf);
+        }
+        // FlxTrail: save the owner's frame every `delay`.
+        for t in &mut self.trails {
+            t.timer += elapsed as f32;
+            if t.timer >= t.delay {
+                t.timer = 0.0;
+                if let Some(c) = &self.chars[t.owner] {
+                    t.poses.push_front(c.actor.pose());
+                    t.poses.truncate(t.length);
+                }
+            }
         }
     }
 
@@ -496,13 +738,118 @@ impl World {
         }
     }
 
+    /// Script props on the cutscene camera: screen space, no zoom.
+    /// Draw a stage actor, with the sprite a script put inside its atlas (lip sync).
+    fn draw_actor(&self, gfx: &mut Gfx, a: &Actor) {
+        let (zoom, host) = (self.camera.zoom() as f32, a.linear_matrix());
+        let fs: Vec<(&str, Box<dyn Fn(&mut Gfx, &crate::gfx::Affine, f32) + '_>)> = a
+            .mouth
+            .iter()
+            .filter_map(|(kw, p)| {
+                let inner = self.props.get(*p)?;
+                let f: Box<dyn Fn(&mut Gfx, &crate::gfx::Affine, f32) + '_> = Box::new(move |g: &mut Gfx, m: &crate::gfx::Affine, alpha: f32| inner.draw_nested(g, m, alpha, zoom, &host));
+                Some((kw.as_str(), f))
+            })
+            .collect();
+        if fs.is_empty() {
+            a.draw(gfx, &self.camera);
+        } else {
+            let list: Vec<(&str, crate::gfx::animate::Inject)> = fs.iter().map(|(k, f)| (*k, f.as_ref() as crate::gfx::animate::Inject)).collect();
+            a.draw_with(gfx, &self.camera, &list);
+        }
+    }
+
+    /// The camera a prop is on (0 = `camGame`).
+    pub fn prop_cam(&self, i: usize) -> u64 {
+        self.screen.iter().find(|(j, _)| *j == i).map_or(0, |(_, c)| *c)
+    }
+
+    /// Props shown on camera `cam`, in draw (zIndex) order, with their zIndex.
+    pub fn props_on(&self, cam: u64) -> Vec<(i32, usize)> {
+        self.order
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Prop(i) if self.prop_cam(*i) == cam => Some((self.props[*i].z_index, *i)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A prop on a screen camera (`camHUD` / `camCutscene`): screen space.
+    pub fn draw_screen_prop(&self, gfx: &mut Gfx, i: usize) {
+        let cam = GameCamera::new(1.0, crate::gfx::VIEW_W as f64, crate::gfx::VIEW_H as f64);
+        if let Some(p) = self.props.get(i) {
+            p.draw(gfx, &cam);
+        }
+    }
+
+    /// `camCutscene`'s script sprites.
+    pub fn draw_screen(&self, gfx: &mut Gfx) {
+        for (_, i) in self.props_on(2) {
+            self.draw_screen_prop(gfx, i);
+        }
+    }
+
+    /// The script cameras listed before (`below`) or after `camGame`, in list order.
+    pub fn extra_cams_around_game(&self, below: bool) -> Vec<u64> {
+        let game = self.cam_order.iter().position(|&c| c == 0).unwrap_or(0);
+        let hud = self.cam_order.iter().position(|&c| c == 1).unwrap_or(self.cam_order.len());
+        self.cam_order
+            .iter()
+            .enumerate()
+            .filter(|&(k, &c)| c >= 3 && if below { k < game } else { k > game && k < hud })
+            .map(|(_, &c)| c)
+            .collect()
+    }
+
+    /// The script cameras listed after `camHUD`.
+    pub fn extra_cams_above_hud(&self) -> Vec<u64> {
+        let hud = self.cam_order.iter().position(|&c| c == 1).unwrap_or(self.cam_order.len());
+        self.cam_order.iter().enumerate().filter(|&(k, &c)| c >= 3 && k > hud).map(|(_, &c)| c).collect()
+    }
+
+    /// Draw a script camera's sprites through that camera.
+    /// Script camera `id`'s world-to-screen transform and alpha, when it shows.
+    pub fn extra_cam_view(&self, id: u64) -> Option<(crate::gfx::Affine, f32)> {
+        let c = self.extra_cams.get(id.checked_sub(3)? as usize)?;
+        if !c.visible || c.alpha <= 0.0 {
+            return None;
+        }
+        let o = c.cam.world_to_screen(0.0, 0.0, [1.0, 1.0]);
+        let e = c.cam.world_to_screen(1.0, 1.0, [1.0, 1.0]);
+        Some((crate::gfx::Affine([(e[0] - o[0]) as f32, 0.0, 0.0, (e[1] - o[1]) as f32, o[0] as f32, o[1] as f32]), c.alpha))
+    }
+
+    pub fn draw_extra_cam(&self, gfx: &mut Gfx, id: u64) {
+        let Some(c) = self.extra_cams.get((id - 3) as usize) else { return };
+        if !c.visible || c.alpha <= 0.0 {
+            return;
+        }
+        let prev = gfx.alpha_mul;
+        gfx.alpha_mul *= c.alpha;
+        for (_, i) in self.props_on(id) {
+            self.props[i].draw(gfx, &c.cam);
+        }
+        gfx.alpha_mul = prev;
+    }
+
     pub fn draw(&self, gfx: &mut Gfx) {
         for s in &self.order {
             match s {
-                Slot::Prop(i) => self.props[*i].draw(gfx, &self.camera),
+                Slot::Prop(i) if self.prop_cam(*i) != 0 => {}
+                Slot::Prop(i) => self.draw_actor(gfx, &self.props[*i]),
                 Slot::Char(i) => {
                     if let Some(c) = &self.chars[*i] {
-                        c.actor.draw(gfx, &self.camera)
+                        self.draw_actor(gfx, &c.actor)
+                    }
+                }
+                Slot::Trail(i) => {
+                    let t = &self.trails[*i];
+                    if let Some(c) = &self.chars[t.owner] {
+                        // Oldest (faintest) first, so newer copies sit on top.
+                        for (n, pose) in t.poses.iter().enumerate().rev() {
+                            c.actor.draw_pose(gfx, &self.camera, pose, t.alpha - t.diff * n as f32);
+                        }
                     }
                 }
             }

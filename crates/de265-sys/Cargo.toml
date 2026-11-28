@@ -1,0 +1,12 @@
+[package]
+name = "de265-sys"
+version = "0.1.0"
+edition = "2021"
+description = "libde265 (H.265 / HEVC decoder), built from the bundled source"
+# The bundled libde265 is LGPL-3.0-or-later; this crate's own glue is Apache-2.0.
+license = "LGPL-3.0-or-later AND Apache-2.0"
+links = "de265"
+publish = false
+
+[build-dependencies]
+cc = "1.2"

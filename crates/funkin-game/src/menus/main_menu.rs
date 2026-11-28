@@ -121,6 +121,11 @@ impl MainMenu {
         self.items[self.selected].y - VIEW_H / 2.0
     }
 
+    /// Waiting for input (nothing picked, not covered by another menu).
+    pub fn idle(&self) -> bool {
+        !self.covered && self.accepted_at.is_none()
+    }
+
     /// Back from freeplay: interactive again, everything visible.
     pub fn uncover(&mut self) {
         self.covered = false;
@@ -149,10 +154,10 @@ impl MainMenu {
                 sfx(&self.scroll_sfx, 0.4);
             }
             KeyCode::Enter | KeyCode::Space => {
-                if matches!(ITEMS[self.selected], "freeplay" | "options" | "merch" | "credits") {
+                if matches!(ITEMS[self.selected], "storymode" | "freeplay" | "options" | "merch" | "credits") {
                     sfx(&self.confirm_sfx, 1.0);
                     self.accepted_at = Some(self.time);
-                    if matches!(ITEMS[self.selected], "options" | "credits") {
+                    if matches!(ITEMS[self.selected], "storymode" | "options" | "credits") {
                         // startExitState: the other items fade out.
                         for (i, f) in self.fades.iter_mut().enumerate() {
                             if i != self.selected {
@@ -160,9 +165,6 @@ impl MainMenu {
                             }
                         }
                     }
-                } else {
-                    // Story mode isn't ported yet.
-                    sfx(&self.cancel_sfx, 1.0);
                 }
             }
             KeyCode::Escape | KeyCode::Backspace => {
@@ -195,6 +197,7 @@ impl MainMenu {
                 self.covered = true;
                 self.magenta.visible = false;
                 return match ITEMS[self.selected] {
+                    "storymode" => MenuAction::OpenStory,
                     "options" => MenuAction::OpenOptions,
                     "credits" => MenuAction::OpenCredits,
                     _ => MenuAction::OpenFreeplay,

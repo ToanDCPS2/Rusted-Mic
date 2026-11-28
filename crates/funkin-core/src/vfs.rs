@@ -1,6 +1,14 @@
 //! A tiny virtual file system: game files are read from a mounted `.pak` (one
 //! file holding every asset) when the path lies inside it, else from disk.
 //!
+//! An overlay folder can stand in for files the asset root lacks (audio the
+//! official build embeds in its executable; see [`set_overlay`]).
+//!
+//! Mods ([`set_mods`]) sit on top, like Polymod: a mod's `images/x.png`
+//! replaces `<root>/images/x.png`, directory listings include every layer, a
+//! mod's `_append/<path>` is added to the end of a text file and
+//! `_merge/<path>` patches a JSON file (a JSON Patch array, as Polymod reads).
+//!
 //! A mounted pack behaves like a folder at its own path: with the pack at
 //! `C:\Game\assets.pak`, `C:\Game\assets.pak\data\songs\x.json` reads the entry
 //! `data/songs/x.json`. Lookups ignore case, like the Windows file system.
@@ -180,6 +188,197 @@ pub fn unmount() {
     *MOUNT.write().unwrap() = None;
 }
 
+/// (asset root, folder): files missing under the root are looked up in the folder.
+static OVERLAY: RwLock<Option<(PathBuf, PathBuf)>> = RwLock::new(None);
+
+/// Serve `dir/<rel>` as `root/<rel>` when the root has no such file.
+pub fn set_overlay(root: &Path, dir: &Path) {
+    *OVERLAY.write().unwrap() = Some((root.to_owned(), dir.to_owned()));
+}
+
+/// (asset root, mod folders lowest priority first).
+static MODS: RwLock<Option<(PathBuf, Vec<PathBuf>)>> = RwLock::new(None);
+
+/// Layer these mod folders over `root` (later ones win).
+pub fn set_mods(root: &Path, mods: Vec<PathBuf>) {
+    *MODS.write().unwrap() = if mods.is_empty() { None } else { Some((root.to_owned(), mods)) };
+}
+
+/// The mod folders currently layered over the assets.
+pub fn mods() -> Vec<PathBuf> {
+    MODS.read().unwrap().as_ref().map(|(_, m)| m.clone()).unwrap_or_default()
+}
+
+/// `path` relative to the mods' asset root, and the mod folders.
+fn mod_rel(path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let guard = MODS.read().unwrap();
+    let (root, mods) = guard.as_ref()?;
+    let rel = path.strip_prefix(root).ok()?.to_owned();
+    Some((rel, mods.clone()))
+}
+
+/// The highest mod's own copy of `path`.
+fn mod_file(path: &Path) -> Option<PathBuf> {
+    let (rel, mods) = mod_rel(path)?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    mods.iter().rev().map(|m| m.join(&rel)).find(|p| p.is_file())
+}
+
+/// Mods' `_append` and `_merge` edits to the file at `path`.
+fn apply_mod_edits(path: &Path, data: Vec<u8>) -> Vec<u8> {
+    let Some((rel, mods)) = mod_rel(path) else { return data };
+    let mut data = data;
+    for m in &mods {
+        let append = m.join("_append").join(&rel);
+        if let Ok(extra) = std::fs::read(&append) {
+            if !data.ends_with(b"\n") && !data.is_empty() {
+                data.push(b'\n');
+            }
+            data.extend_from_slice(&extra);
+        }
+        if rel.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
+            let merge = m.join("_merge").join(&rel);
+            if let Ok(patch) = std::fs::read(&merge) {
+                match json_merge(&data, &patch) {
+                    Ok(d) => data = d,
+                    Err(e) => log::warn!("{}: {e}", merge.display()),
+                }
+            }
+        }
+    }
+    data
+}
+
+fn parse_json(b: &[u8]) -> Result<serde_json::Value, String> {
+    let text = String::from_utf8_lossy(b);
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| e.to_string())
+}
+
+/// Polymod JSON merge: a JSON Patch array (`add`, `remove`, `replace`,
+/// `move`, `copy`, `test`), or an object merged key by key.
+fn json_merge(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> {
+    use serde_json::Value;
+    let mut doc = parse_json(base)?;
+    match parse_json(patch)? {
+        Value::Array(ops) => {
+            for op in ops {
+                if let Err(e) = json_patch_op(&mut doc, &op) {
+                    log::warn!("json patch {op}: {e}");
+                }
+            }
+        }
+        p @ Value::Object(_) => merge_objects(&mut doc, p),
+        _ => return Err("merge file is neither a patch list nor an object".into()),
+    }
+    serde_json::to_vec(&doc).map_err(|e| e.to_string())
+}
+
+fn merge_objects(doc: &mut serde_json::Value, patch: serde_json::Value) {
+    match (doc, patch) {
+        (serde_json::Value::Object(d), serde_json::Value::Object(p)) => {
+            for (k, v) in p {
+                merge_objects(d.entry(k).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (d, p) => *d = p,
+    }
+}
+
+fn pointer_parts(ptr: &str) -> Vec<String> {
+    ptr.split('/').skip(1).map(|p| p.replace("~1", "/").replace("~0", "~")).collect()
+}
+
+/// The value at a split JSON pointer.
+fn walk<'a>(doc: &'a mut serde_json::Value, parts: &[String]) -> Result<&'a mut serde_json::Value, String> {
+    use serde_json::Value;
+    let mut cur = doc;
+    for p in parts {
+        cur = match cur {
+            Value::Object(m) => m.get_mut(p).ok_or_else(|| format!("no key {p}"))?,
+            Value::Array(a) => a.get_mut(p.parse::<usize>().map_err(|_| format!("bad index {p}"))?).ok_or_else(|| format!("no index {p}"))?,
+            _ => return Err(format!("{p}: not a container")),
+        };
+    }
+    Ok(cur)
+}
+
+/// Insert / set at a JSON pointer (`-` appends to an array).
+fn json_add(doc: &mut serde_json::Value, ptr: &str, value: serde_json::Value, replace: bool) -> Result<(), String> {
+    use serde_json::Value;
+    let parts = pointer_parts(ptr);
+    let Some((last, parents)) = parts.split_last() else {
+        *doc = value;
+        return Ok(());
+    };
+    match walk(doc, parents)? {
+        Value::Object(m) => {
+            m.insert(last.clone(), value);
+        }
+        Value::Array(a) if last == "-" => a.push(value),
+        Value::Array(a) => {
+            let i: usize = last.parse().map_err(|_| format!("bad index {last}"))?;
+            if replace {
+                *a.get_mut(i).ok_or("index out of range")? = value;
+            } else if i <= a.len() {
+                a.insert(i, value);
+            } else {
+                return Err("index out of range".into());
+            }
+        }
+        _ => return Err("not a container".into()),
+    }
+    Ok(())
+}
+
+fn json_remove(doc: &mut serde_json::Value, ptr: &str) -> Result<serde_json::Value, String> {
+    use serde_json::Value;
+    let parts = pointer_parts(ptr);
+    let (last, parents) = parts.split_last().ok_or("can't remove the root")?;
+    match walk(doc, parents)? {
+        Value::Object(m) => m.remove(last).ok_or_else(|| "no such key".into()),
+        Value::Array(a) => {
+            let i: usize = last.parse().map_err(|_| "bad index".to_string())?;
+            (i < a.len()).then(|| a.remove(i)).ok_or_else(|| "index out of range".into())
+        }
+        _ => Err("not a container".into()),
+    }
+}
+
+fn json_patch_op(doc: &mut serde_json::Value, op: &serde_json::Value) -> Result<(), String> {
+    let kind = op.get("op").and_then(|v| v.as_str()).ok_or("no op")?;
+    let path = op.get("path").and_then(|v| v.as_str()).ok_or("no path")?;
+    let value = || op.get("value").cloned().ok_or("no value");
+    match kind {
+        "add" => json_add(doc, path, value()?, false),
+        "replace" => json_add(doc, path, value()?, true),
+        "remove" => json_remove(doc, path).map(|_| ()),
+        "move" | "copy" => {
+            let from = op.get("from").and_then(|v| v.as_str()).ok_or("no from")?;
+            let v = if kind == "move" { json_remove(doc, from)? } else { doc.pointer(from).cloned().ok_or("no such path")? };
+            json_add(doc, path, v, false)
+        }
+        "test" => Ok(()),
+        _ => Err(format!("unknown op {kind}")),
+    }
+}
+
+/// Where `path` would be in the overlay folder.
+fn overlay(path: &Path) -> Option<PathBuf> {
+    let guard = OVERLAY.read().unwrap();
+    let (root, dir) = guard.as_ref()?;
+    let rel = path.strip_prefix(root).ok()?;
+    Some(dir.join(rel))
+}
+
+fn base_is_file(path: &Path) -> bool {
+    match in_pack(path) {
+        Some((pack, key)) => pack.by_path.contains_key(&key),
+        None => path.is_file(),
+    }
+}
+
 /// The mounted pack and the key for `path`, if `path` lies inside it.
 fn in_pack(path: &Path) -> Option<(Arc<Pack>, String)> {
     let pack = MOUNT.read().unwrap().clone()?;
@@ -188,6 +387,20 @@ fn in_pack(path: &Path) -> Option<(Arc<Pack>, String)> {
 }
 
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
+    let data = match mod_file(path) {
+        Some(m) => std::fs::read(m)?,
+        None => read_base(path)?,
+    };
+    Ok(apply_mod_edits(path, data))
+}
+
+/// The file without any mod's changes.
+fn read_base(path: &Path) -> io::Result<Vec<u8>> {
+    if !base_is_file(path) {
+        if let Some(o) = overlay(path).filter(|o| o.is_file()) {
+            return std::fs::read(o);
+        }
+    }
     match in_pack(path) {
         Some((pack, key)) => pack.read_entry(&key).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
         None => std::fs::read(path),
@@ -199,17 +412,21 @@ pub fn read_to_string(path: &Path) -> io::Result<String> {
 }
 
 pub fn is_file(path: &Path) -> bool {
-    match in_pack(path) {
-        Some((pack, key)) => pack.by_path.contains_key(&key),
-        None => path.is_file(),
-    }
+    base_is_file(path) || overlay(path).is_some_and(|o| o.is_file()) || mod_file(path).is_some()
+}
+
+/// The mod supplying the file at `path`, if one replaces or adds it.
+pub fn from_mod(path: &Path) -> Option<PathBuf> {
+    let (rel, mods) = mod_rel(path)?;
+    mods.iter().rev().find(|m| m.join(&rel).is_file()).cloned()
 }
 
 pub fn is_dir(path: &Path) -> bool {
-    match in_pack(path) {
+    let base = match in_pack(path) {
         Some((pack, key)) => pack.dirs.contains_key(&key),
         None => path.is_dir(),
-    }
+    };
+    base || overlay(path).is_some_and(|o| o.is_dir()) || mod_rel(path).is_some_and(|(rel, mods)| mods.iter().any(|m| m.join(&rel).is_dir()))
 }
 
 pub fn exists(path: &Path) -> bool {
@@ -225,6 +442,35 @@ pub struct DirEntry {
 }
 
 pub fn read_dir(path: &Path) -> io::Result<Vec<DirEntry>> {
+    let base = read_dir_base(path);
+    let Some((rel, mods)) = mod_rel(path) else { return base };
+    // Every layer's entries, by name (case-insensitively, like the pack).
+    let found_base = base.is_ok();
+    let mut out = base.unwrap_or_default();
+    let mut found = found_base;
+    let mut seen: std::collections::HashSet<String> = out.iter().map(|e| e.name.to_lowercase()).collect();
+    for m in &mods {
+        let Ok(rd) = std::fs::read_dir(m.join(&rel)) else { continue };
+        found = true;
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if rel.as_os_str().is_empty() && name.starts_with('_') {
+                // `_merge`, `_append`, `_polymod_meta.json`: not assets.
+                continue;
+            }
+            if seen.insert(name.to_lowercase()) {
+                out.push(DirEntry { path: path.join(&name), is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false), name });
+            }
+        }
+    }
+    if found {
+        Ok(out)
+    } else {
+        Err(io::ErrorKind::NotFound.into())
+    }
+}
+
+fn read_dir_base(path: &Path) -> io::Result<Vec<DirEntry>> {
     match in_pack(path) {
         Some((pack, key)) => {
             let children = pack.dirs.get(&key).ok_or(io::ErrorKind::NotFound)?;

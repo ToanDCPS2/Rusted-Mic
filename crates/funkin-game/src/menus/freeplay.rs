@@ -1,7 +1,7 @@
 //! Port of the core of `FreeplayState` (with Boyfriend as the DJ): the backing
 //! card, the DJ's intro/idle/confirm, the song capsules with their jump-in and
 //! smooth scrolling, difficulty selection, song previews, and the score/clear
-//! displays (scores are 0% until save data is ported).
+//! displays (from the saved song scores).
 
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver};
@@ -15,16 +15,18 @@ use crate::assets::Assets;
 use crate::audio::{Audio, Pcm, Track};
 use crate::gfx::animate::{AnimRange, AnimateAtlas};
 use crate::gfx::atlas::{Anim, Atlas};
-use crate::gfx::{fill, Affine, Color, Gfx, TexId, VIEW_H, VIEW_W, WHITE};
+use crate::gfx::{fill, Affine, Color, Gfx, MaskOp, TexId, VIEW_H, VIEW_W, WHITE};
 
 use super::album_roll::AlbumRoll;
 use super::bf_card::BfCard;
+use super::pico_card::PicoCard;
+use super::players::{parse_hex, FreeplayStyle, PlayerData, Players};
 use super::{random, smooth_lerp, Fonts, MenuAction, Music, Tween};
 
 /// `SongRegistry.listAllDifficulties` for Boyfriend.
 const DIFFICULTIES: [&str; 5] = ["easy", "normal", "hard", "erect", "nightmare"];
 /// `LevelRegistry.listBaseGameEntryIds`: freeplay lists songs week by week.
-const BASE_LEVELS: [&str; 10] = ["tutorial", "week1", "week2", "week3", "week4", "week5", "week6", "week7", "weekend1", "sserafim"];
+pub(crate) const BASE_LEVELS: [&str; 10] = ["tutorial", "week1", "week2", "week3", "week4", "week5", "week6", "week7", "weekend1", "sserafim"];
 const REAL_SCALED: f32 = 0.8;
 const X_FRAMES: [f32; 7] = [1.7, 1.8, 0.85, 0.85, 0.97, 0.97, 1.0];
 const CAPSULE_W: f32 = 612.0;
@@ -71,8 +73,9 @@ impl FreeplaySong {
     }
 }
 
-/// Every playable song, in level order (`FreeplayState.generateSongList`).
-pub fn list_songs(registry: &SongRegistry) -> Vec<FreeplaySong> {
+/// Every song `character` can play, in level order (`FreeplayState.generateSongList`
+/// with `Song.getVariationsByCharacter`).
+pub fn list_songs(registry: &SongRegistry, players: &Players, character: &str) -> Vec<FreeplaySong> {
     let mut levels = registry.load_levels();
     levels.sort_by_key(|l| (BASE_LEVELS.iter().position(|b| *b == l.id).unwrap_or(BASE_LEVELS.len()), l.id.clone()));
     let mut order: Vec<String> = Vec::new();
@@ -92,13 +95,23 @@ pub fn list_songs(registry: &SongRegistry) -> Vec<FreeplaySong> {
     let mut out = Vec::new();
     for id in order {
         let Ok(song) = registry.load_song(&id) else { continue };
-        let Some(default) = song.variations.get("default").or_else(|| song.variations.values().next()) else { continue };
+        let shown = |v: &funkin_core::song::SongVariation| players.shows(character, &v.metadata.play_data.characters.player);
+        let Some(default) = song.variations.get("default").filter(|v| shown(v)).or_else(|| song.variations.values().find(|v| shown(v))) else {
+            continue;
+        };
         let mut charts: Vec<(String, String)> = Vec::new();
         let mut ratings = HashMap::new();
         let mut previews = HashMap::new();
         let mut opponents = HashMap::new();
         let mut albums = HashMap::new();
-        for (var_id, v) in &song.variations {
+        let mut var_ids: Vec<&String> = song.variations.keys().collect();
+        // Defaults first, then alphabetically (`SortUtil.defaultsThenAlphabetically`).
+        var_ids.sort_by_key(|k| (k.as_str() != "default", (*k).clone()));
+        for var_id in var_ids {
+            let v = &song.variations[var_id];
+            if !shown(v) {
+                continue;
+            }
             let pd = &v.metadata.play_data;
             for d in &pd.difficulties {
                 if v.chart.notes(d).is_some() && !charts.iter().any(|(cd, _)| cd == d) {
@@ -155,10 +168,17 @@ enum Dj {
     Intro,
     Idle,
     Confirm,
+    CharSelect,
+}
+
+/// The backing card script for the current character.
+enum Card {
+    Bf(BfCard),
+    Pico(PicoCard),
 }
 
 /// `PixelatedIcon`: a character's freeplay pixel icon (idle / confirm / confirm-hold at 10 fps).
-struct PixelIcon {
+pub struct PixelIcon {
     atlas: Atlas,
     idle: Anim,
     confirm: Anim,
@@ -169,7 +189,7 @@ struct PixelIcon {
 
 impl PixelIcon {
     /// `setCharacter`: the longest `-`-separated prefix of `char` with a `<prefix>pixel` image.
-    fn load(gfx: &mut Gfx, assets: &Assets, char: &str) -> Option<Self> {
+    pub fn load(gfx: &mut Gfx, assets: &Assets, char: &str) -> Option<Self> {
         let parts: Vec<&str> = char.split('-').collect();
         let name = (1..=parts.len())
             .map(|n| parts[..n].join("-"))
@@ -196,14 +216,26 @@ impl PixelIcon {
         Some(Self { atlas, idle, confirm, hold, origin_x })
     }
 
-    /// Draw at `(x, y)` (the sprite position); `confirm` = seconds since confirming.
-    fn draw(&self, gfx: &mut Gfx, x: f32, y: f32, t: f32, confirm: Option<f32>) {
-        let f = match confirm {
+    fn frame(&self, t: f32, confirm: Option<f32>) -> Option<usize> {
+        match confirm {
             Some(c) if c * 10.0 < self.confirm.frames.len() as f32 => self.confirm.frame_at(c, 10.0, false),
             Some(c) => self.hold.frame_at(c - self.confirm.duration(10.0), 10.0, true),
             None => self.idle.frame_at(t, 10.0, true),
-        };
-        let Some(f) = f else { return };
+        }
+    }
+
+    /// Draw with the frame's centre at `(cx, cy)`, scaled by `scale` (character select).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_centered(&self, gfx: &mut Gfx, cx: f32, cy: f32, scale: f32, t: f32, confirm: Option<f32>, color: Color) {
+        let Some(f) = self.frame(t, confirm) else { return };
+        let fr = &self.atlas.frames[f];
+        let m = Affine::translate(cx, cy).then(&Affine::scale(scale, scale)).then(&Affine::translate(-fr.frame_w / 2.0, -fr.frame_h / 2.0));
+        self.atlas.draw_xf(gfx, f, &m, false, color);
+    }
+
+    /// Draw at `(x, y)` (the sprite position); `confirm` = seconds since confirming.
+    fn draw(&self, gfx: &mut Gfx, x: f32, y: f32, t: f32, confirm: Option<f32>) {
+        let Some(f) = self.frame(t, confirm) else { return };
         let oy = self.atlas.frames[f].frame_h / 2.0;
         let m = Affine::translate(x + self.origin_x, y + oy)
             .then(&Affine::scale(2.0, 2.0))
@@ -237,11 +269,22 @@ impl Digits {
 pub struct Freeplay {
     /// `Preferences.flashingLights`: difficulty graphics animate only when on.
     pub flashing_lights: bool,
+    /// The playable character (`currentCharacterId`).
+    pub character: String,
     songs: Arc<Vec<FreeplaySong>>,
+    /// Indices into `DIFFICULTIES` that this character has charts for.
+    diffs: Vec<usize>,
     capsules: Vec<Capsule>,
     selected: usize,
+    /// When the selection last changed (`CapsuleText.initMove` restarts).
+    selected_at: f32,
     diff: usize,
     time: f32,
+    /// Saved bests, `song:difficulty:variation` → (score, completion).
+    pub scores: HashMap<String, (i64, f64)>,
+    /// `lerpScore` / `lerpCompletion`.
+    lerp_score: f64,
+    lerp_completion: f64,
     intro_done_at: Option<f32>,
     exit_at: Option<f32>,
     confirm_at: Option<f32>,
@@ -270,7 +313,19 @@ pub struct Freeplay {
     clear_box: TexId,
     icons: HashMap<String, Option<PixelIcon>>,
     album: AlbumRoll,
-    card: BfCard,
+    card: Card,
+    glow: Color,
+    /// The pink card's colour once the intro is done.
+    card_color: Color,
+    gradient: Option<TexId>,
+    /// More than one character unlocked: Tab opens character select.
+    can_char_select: bool,
+    char_select_delay: f32,
+    /// When Tab was pressed / when the slide to character select began.
+    char_select_at: Option<f32>,
+    to_char_select_at: Option<f32>,
+    /// Coming back from character select: things slide back in.
+    from_char_select: bool,
 
     sfx_scroll: Option<Arc<Pcm>>,
     sfx_confirm: Option<Arc<Pcm>>,
@@ -287,15 +342,28 @@ fn load_tex(gfx: &mut Gfx, assets: &Assets, spec: &str) -> Result<TexId, String>
 }
 
 impl Freeplay {
-    pub fn new(gfx: &mut Gfx, assets: &Assets, songs: Arc<Vec<FreeplaySong>>, remembered: Option<(&str, &str)>) -> Result<Self, String> {
-        let dj = AnimateAtlas::load(gfx, &assets.level_image("default:freeplay/freeplay-boyfriend", None, ""), true)?;
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        gfx: &mut Gfx,
+        assets: &Assets,
+        songs: Arc<Vec<FreeplaySong>>,
+        remembered: Option<(&str, &str)>,
+        player: &PlayerData,
+        style: &FreeplayStyle,
+        can_char_select: bool,
+        from_char_select: bool,
+    ) -> Result<Self, String> {
+        let dj_data = player.freeplay_dj.clone().unwrap_or_default();
+        let dj_path = if dj_data.asset_path.is_empty() { "freeplay/freeplay-boyfriend".to_owned() } else { dj_data.asset_path.clone() };
+        let dj = AnimateAtlas::load(gfx, &assets.level_image(&format!("default:{dj_path}"), None, ""), true)?;
         let mut dj_anims = HashMap::new();
-        for (k, label) in [("intro", "Intro"), ("idle", "Idle"), ("confirm", "Confirm")] {
+        for (k, fallback) in [("intro", "Intro"), ("idle", "Idle"), ("confirm", "Confirm"), ("charSelect", "To Character Select")] {
+            let label = dj_data.animations.iter().find(|a| a.name == k).map(|a| a.prefix.as_str()).unwrap_or(fallback);
             if let Some(r) = dj.anim(label) {
                 dj_anims.insert(k, r);
             }
         }
-        let capsule = assets.atlas(gfx, "default:freeplay/freeplayCapsule/capsule/freeplayCapsule")?;
+        let capsule = assets.atlas(gfx, &format!("default:{}", style.capsule_asset))?;
         let capsule_sel = capsule.prefix("mp3 capsule w backing0");
         let capsule_unsel = capsule.prefix("mp3 capsule w backing NOT SELECTED");
         let mut diff_sprites = Vec::new();
@@ -313,25 +381,36 @@ impl Freeplay {
             };
             diff_sprites.push(sprite);
         }
-        let selector = assets.atlas(gfx, "default:freeplay/freeplaySelector/freeplaySelector")?;
+        let selector = assets.atlas(gfx, &format!("default:{}", style.selector_asset))?;
         let selector_anim = selector.prefix("arrow pointer loop");
 
         let album_ids: Vec<String> = songs.iter().flat_map(|s| s.albums.values().cloned()).collect();
         let album = AlbumRoll::new(gfx, assets, &album_ids)?;
-        let card = BfCard::new(gfx, assets);
+        let (card, card_color) = match player.id.as_str() {
+            "pico" => (Card::Pico(PicoCard::new(gfx, assets)), hex(0x98A2F3)),
+            _ => (Card::Bf(BfCard::new(gfx, assets)), hex(0xFFD863)),
+        };
+        let diffs: Vec<usize> = (0..DIFFICULTIES.len()).filter(|&d| songs.iter().any(|s| s.variation(DIFFICULTIES[d]).is_some())).collect();
+        let diffs = if diffs.is_empty() { vec![1] } else { diffs };
         let mut fp = Self {
             flashing_lights: true,
+            character: player.id.clone(),
+            diffs,
             songs,
             capsules: Vec::new(),
             selected: 0,
-            diff: 1,
+            selected_at: 0.0,
+            diff: 0,
             time: 0.0,
+            scores: HashMap::new(),
+            lerp_score: 0.0,
+            lerp_completion: 0.0,
             intro_done_at: None,
             exit_at: None,
             confirm_at: None,
             pending_play: None,
             pink_back: load_tex(gfx, assets, "default:freeplay/pinkBack")?,
-            backing_image: load_tex(gfx, assets, "default:freeplay/freeplayBGweek1-bf")?,
+            backing_image: load_tex(gfx, assets, &format!("default:{}", style.bg_asset)).or_else(|_| load_tex(gfx, assets, "default:freeplay/freeplayBGweek1-bf"))?,
             dj,
             dj_anims,
             dj_state: Dj::Intro,
@@ -349,11 +428,20 @@ impl Freeplay {
             selector_anim,
             selector_press: [-1.0; 2],
             highscore: assets.atlas(gfx, "default:freeplay/highscore")?,
-            score_digits: Digits::load(gfx, assets, "default:digital_numbers", " DIGITAL")?,
+            score_digits: Digits::load(gfx, assets, &format!("default:{}", style.numbers_asset), " DIGITAL")
+                .or_else(|_| Digits::load(gfx, assets, "default:digital_numbers", " DIGITAL"))?,
             clear_box: load_tex(gfx, assets, "default:freeplay/clearBox")?,
             icons: HashMap::new(),
             album,
             card,
+            card_color,
+            glow: style.capsule_text_colors.first().and_then(|c| parse_hex(c)).unwrap_or(GLOW),
+            gradient: load_tex(gfx, assets, "default:freeplay/transitionGradient").ok(),
+            can_char_select,
+            char_select_delay: dj_data.char_select.and_then(|c| c.transition_delay).unwrap_or(0.25),
+            char_select_at: None,
+            to_char_select_at: None,
+            from_char_select,
             sfx_scroll: assets.sound("default:scrollMenu"),
             sfx_confirm: assets.sound("default:confirmMenu"),
             sfx_cancel: assets.sound("default:cancelMenu"),
@@ -371,19 +459,29 @@ impl Freeplay {
                 e.insert(icon);
             }
         }
+        // Start on "normal" if this character has it.
+        fp.diff = fp.diffs.iter().position(|&d| d == 1).unwrap_or(0);
         if let Some((song, diff)) = remembered {
-            if let Some(d) = DIFFICULTIES.iter().position(|x| *x == diff) {
+            if let Some(d) = fp.diffs.iter().position(|&x| DIFFICULTIES[x] == diff) {
                 fp.diff = d;
             }
             fp.rebuild(Some(song));
         } else {
             fp.rebuild(None);
         }
+        if from_char_select {
+            // forcePosition(): no jump-in, capsules already in place.
+            for c in &mut fp.capsules {
+                c.x = c.tx;
+                c.y = c.ty;
+                c.jump_at = -10.0;
+            }
+        }
         Ok(fp)
     }
 
     fn diff_id(&self) -> &'static str {
-        DIFFICULTIES[self.diff]
+        DIFFICULTIES[self.diffs[self.diff]]
     }
 
     /// The selected song id and difficulty, for coming back to freeplay.
@@ -423,6 +521,7 @@ impl Freeplay {
 
     /// `changeSelection`'s capsule targets.
     fn retarget(&mut self) {
+        self.selected_at = self.time;
         let cur = self.selected as f32;
         for (m, c) in self.capsules.iter_mut().enumerate() {
             let idx = m as f32 + 1.0 - cur;
@@ -447,7 +546,7 @@ impl Freeplay {
     }
 
     fn interactive(&self) -> bool {
-        self.intro_done_at.is_some() && self.exit_at.is_none() && self.confirm_at.is_none()
+        self.intro_done_at.is_some() && self.exit_at.is_none() && self.confirm_at.is_none() && self.char_select_at.is_none()
     }
 
     fn change_selection(&mut self, audio: &Audio, music: &mut Music, by: i32) {
@@ -478,12 +577,14 @@ impl Freeplay {
         }
         self.album.set_difficulty_stars(song.and_then(|s| s.ratings.get(diff).copied()).unwrap_or(0));
         let level = song.and_then(|s| s.level.clone());
-        self.card.set_level(level.as_deref());
+        if let Card::Bf(c) = &mut self.card {
+            c.set_level(level.as_deref());
+        }
     }
 
     fn change_diff(&mut self, audio: &Audio, music: &mut Music, by: i32) {
         let keep = self.remembered().map(|(s, _)| s);
-        self.diff = (self.diff as i32 + by).rem_euclid(DIFFICULTIES.len() as i32) as usize;
+        self.diff = (self.diff as i32 + by).rem_euclid(self.diffs.len() as i32) as usize;
         self.rebuild(keep.as_deref());
         let from = if by > 0 { 500.0 } else { -320.0 };
         self.diff_slide = Tween::new(from, 90.0, self.time, 0.2, "expoOut");
@@ -512,6 +613,21 @@ impl Freeplay {
                 let by = self.capsules.len() as i32 - 1 - self.selected as i32;
                 if by != 0 {
                     self.change_selection(audio, music, by);
+                }
+            }
+            // FREEPLAY_CHAR_SELECT (`tryOpenCharSelect`).
+            KeyCode::F16 => {
+                if !self.can_char_select {
+                    self.sfx(audio, &self.sfx_cancel, 1.0);
+                } else {
+                    self.sfx(audio, &self.sfx_confirm, 1.0);
+                    self.char_select_at = Some(self.time);
+                    self.preview_due = None;
+                    self.preview_rx = None;
+                    if self.dj_anims.contains_key("charSelect") {
+                        self.dj_state = Dj::CharSelect;
+                        self.dj_since = 0.0;
+                    }
                 }
             }
             KeyCode::Enter | KeyCode::Space => {
@@ -555,19 +671,43 @@ impl Freeplay {
         MenuAction::None
     }
 
+    /// `intendedScore` / `intendedCompletion` for the selected song.
+    fn intended_score(&self) -> (i64, f64) {
+        let Some(s) = self.capsules.get(self.selected).and_then(|c| c.song) else { return (0, 0.0) };
+        let song = &self.songs[s];
+        let diff = self.diff_id();
+        let var = song.variation(diff).unwrap_or("default");
+        self.scores.get(&format!("{}:{}:{}", song.id, diff, var)).copied().unwrap_or((0, 0.0))
+    }
+
     pub fn update(&mut self, dt: f32, audio: &Audio, assets: &Assets, music: &mut Music) -> MenuAction {
         self.time += dt;
+        // lerpScoreDisplays: smoothLerpPrecision then snap.
+        let (score, completion) = self.intended_score();
+        let lerp = |cur: f64, target: f64, dur: f64, snap: f64| {
+            let v = target + (cur - target) * 0.01f64.powf(dt as f64 / dur);
+            if (v - target).abs() < snap { target } else { v }
+        };
+        self.lerp_score = lerp(self.lerp_score, score as f64, 0.2, 1.0);
+        self.lerp_completion = lerp(self.lerp_completion, completion, 0.5, 0.01);
         self.dj_since += dt;
 
         // DJ: intro → idle (and the rest of the screen appears).
         if self.dj_state == Dj::Intro {
             let len = self.dj_anims.get("intro").map(|r| r.len).unwrap_or(0) as f32;
-            if self.dj_since * 24.0 >= len {
+            if self.from_char_select || self.dj_since * 24.0 >= len {
                 self.dj_state = Dj::Idle;
                 self.dj_since = 0.0;
-                self.intro_done_at = Some(self.time);
-                self.diff_slide = Tween::new(-300.0, 90.0, self.time, 0.6, "quartOut");
-                self.album.play_intro();
+                if self.from_char_select {
+                    // onDJIntroDone with the intro tweens already finished.
+                    self.intro_done_at = Some(self.time - 10.0);
+                    self.diff_slide = Tween::new(90.0, 90.0, 0.0, 0.0, "linear");
+                    self.album.skip_intro();
+                } else {
+                    self.intro_done_at = Some(self.time);
+                    self.diff_slide = Tween::new(-300.0, 90.0, self.time, 0.6, "quartOut");
+                    self.album.play_intro();
+                }
                 let diff = self.diff_id();
                 let id = self.capsules.get(self.selected).and_then(|c| c.song).map(|s| self.songs[s].album(diff).to_owned());
                 self.album.set_album(id.as_deref());
@@ -584,7 +724,24 @@ impl Freeplay {
             .map(|s| s.bpm)
             .unwrap_or(102.0);
         let ms = music.time_ms(audio);
-        self.card.update(self.time, ms, bpm, music.playing());
+        match &mut self.card {
+            Card::Bf(c) => c.update(self.time, ms, bpm, music.playing()),
+            Card::Pico(c) => c.update(self.time, ms, bpm, music.playing()),
+        }
+
+        // transitionToCharSelect, after the DJ's transition delay.
+        if let Some(at) = self.char_select_at {
+            if self.to_char_select_at.is_none() && self.time - at >= self.char_select_delay {
+                self.to_char_select_at = Some(self.time);
+                music.fade(music.volume(), 0.0, 0.9);
+            }
+        }
+        if let Some(at) = self.to_char_select_at {
+            if self.time - at >= 0.9 {
+                music.stop(audio);
+                return MenuAction::OpenCharSelect(self.character.clone());
+            }
+        }
 
         for c in &mut self.capsules {
             if self.time >= c.jump_at {
@@ -678,6 +835,7 @@ impl Freeplay {
             Dj::Intro => ("intro", false),
             Dj::Idle => ("idle", true),
             Dj::Confirm => ("confirm", false),
+            Dj::CharSelect => ("charSelect", false),
         };
         let r = *self.dj_anims.get(name)?;
         let i = (self.dj_since * 24.0) as u32;
@@ -697,30 +855,37 @@ impl Freeplay {
 
         // Backing card: the pink card slides in, turning yellow once the DJ's intro ends.
         let (pw, ph) = gfx.texture_size(self.pink_back);
-        let pink_x = Tween::new(-pw, 0.0, 0.0, 0.6, "quartOut").at(t) + exit_left;
+        // skipIntroTween: coming from character select the intro tweens are done.
+        let ti = if self.from_char_select { t + 10.0 } else { t };
+        let pink_x = Tween::new(-pw, 0.0, 0.0, 0.6, "quartOut").at(ti) + exit_left;
         let confirm = self.confirm_at.map(|at| t - at);
         let pink_col = match (confirm, intro) {
             // disappear(): yellow back to pink over 0.25 s.
             _ if self.exit_at.is_some() => {
                 let e = t - self.exit_at.unwrap_or(t);
-                lerp_color(hex(0xFFD863), hex(0xFFD0D5), ease_k("quadOut", e / 0.25))
+                lerp_color(self.card_color, hex(0xFFD0D5), ease_k("quadOut", e / 0.25))
             }
             (Some(c), _) => lerp_color([1.0, 0.816, 0.835, 1.0], [0.09, 0.094, 0.192, 1.0], ease_k("quadOut", c / 0.33)),
-            (None, Some(_)) => hex(0xFFD863),
+            (None, Some(_)) => self.card_color,
             _ => hex(0xFFD4E9),
         };
         gfx.image(self.pink_back, [0.0, 0.0, pw, ph], pink_x, 0.0, pw, ph, pink_col);
         // disappear() hides the orange strip, scrolling texts and glow at once.
         if intro.is_some() && confirm.is_none() && self.exit_at.is_none() {
-            // orangeBackShit, alpha-masked by the card's own top rows.
-            gfx.image(self.pink_back, [0.0, 0.0, pw, 75.0], 84.0 + pink_x, 440.0, pw, 75.0, hex(0xFEDA00));
-            gfx.rect(pink_x, 440.0, 100.0, 75.0, hex(0xFFD400));
-            self.card.draw(gfx, fonts, t);
+            match &self.card {
+                Card::Bf(c) => {
+                    // orangeBackShit, alpha-masked by the card's own top rows.
+                    gfx.image(self.pink_back, [0.0, 0.0, pw, 75.0], 84.0 + pink_x, 440.0, pw, 75.0, hex(0xFEDA00));
+                    gfx.rect(pink_x, 440.0, 100.0, 75.0, hex(0xFFD400));
+                    c.draw(gfx, fonts, t);
+                }
+                Card::Pico(c) => c.draw(gfx, t),
+            }
         }
 
         // DJ, drawn through the Animate stage matrix.
         if let Some((r, f)) = self.dj_frame() {
-            let m = Affine::translate(640.0 + exit_left * 1.2, 360.0);
+            let m = Affine::translate(640.0 + exit_left * 1.2, 360.0 + self.char_select_y(175.0));
             self.dj.draw(gfx, r.tl, f, &m, WHITE);
         }
 
@@ -728,7 +893,8 @@ impl Freeplay {
         let (bw, bh) = gfx.texture_size(self.backing_image);
         let s = (VIEW_H + 1.0) / bh;
         let bx = pw * 0.74 + exit_right;
-        let black_x = Tween::new(VIEW_W, bx, 0.0, 0.7, "quintOut").at(t).max(bx);
+        let black_x = Tween::new(VIEW_W, bx, 0.0, 0.7, "quintOut").at(ti).max(bx);
+        let back_y = self.char_select_y(100.0);
         let tint = match (since_intro, confirm) {
             (_, Some(c)) => 0.66 - 0.33 * ease_k("expoOut", c / 2.0),
             (Some(e), None) => ease_k("expoOut", e / 0.6),
@@ -736,35 +902,39 @@ impl Freeplay {
         };
         if since_intro.is_none_or(|e| e < 0.6) {
             let white = gfx.white();
-            draw_angle_masked(gfx, white, 90.0 / bw, black_x, bw * s, bh * s, [0.0, 0.0, 0.0, 1.0]);
+            draw_angle_masked(gfx, white, 90.0 / bw, black_x, back_y, bw * s, bh * s, [0.0, 0.0, 0.0, 1.0]);
         }
         if intro.is_some() {
-            draw_angle_masked(gfx, self.backing_image, 90.0 / bw, bx, bw * s, bh * s, [tint, tint, tint, 1.0]);
+            draw_angle_masked(gfx, self.backing_image, 90.0 / bw, bx, back_y, bw * s, bh * s, [tint, tint, tint, 1.0]);
         }
 
         // Difficulty sprite.
         let diff_x = self.diff_slide.at(t) + exit_left;
+        let up270 = self.char_select_y(270.0);
         if intro.is_some() {
-            if let Some(Some((tex, sparrow))) = self.diff_sprites.get(self.diff) {
+            if let Some(Some((tex, sparrow))) = self.diff_sprites.get(self.diffs[self.diff]) {
                 match sparrow {
                     Some((a, an)) if !an.frames.is_empty() => {
                         let at = if self.flashing_lights { t } else { 0.0 };
                         if let Some(f) = an.frame_at(at, 24.0, true) {
-                            a.draw(gfx, f, diff_x, 80.0, 1.0, WHITE);
+                            a.draw(gfx, f, diff_x, 80.0 + up270, 1.0, WHITE);
                         }
                     }
-                    _ => gfx.sprite(*tex, diff_x, 80.0, 1.0, WHITE),
+                    _ => gfx.sprite(*tex, diff_x, 80.0 + up270, 1.0, WHITE),
                 }
             }
         }
 
-        // Capsules.
+        // Capsules (exitMoversCharSel: up 250 px going to character select,
+        // back down coming from it).
+        let cs_y = self.char_select_y(250.0);
         for (m, c) in self.capsules.iter().enumerate() {
             if t < c.jump_at {
                 continue;
             }
             let jump = t - c.jump_at;
-            self.draw_capsule(gfx, fonts, c, m == self.selected, jump, exit_right);
+            let near = (m as f32 - self.selected as f32).abs() - 1.0 < 5.0;
+            self.draw_capsule(gfx, fonts, c, m == self.selected, jump, exit_right, if near { cs_y } else { 0.0 });
         }
 
         // Difficulty selectors.
@@ -772,7 +942,7 @@ impl Freeplay {
             for (i, x) in [20.0f32, 325.0].into_iter().enumerate() {
                 let pressed = self.selector_press[i] >= 0.0 && t - self.selector_press[i] < 0.1;
                 if let Some(f) = self.selector_anim.frame_at(t, 24.0, true) {
-                    let m = Affine::translate(x + exit_left, 70.0 + if pressed { 5.0 } else { 0.0 });
+                    let m = Affine::translate(x + exit_left, 70.0 + up270 + if pressed { 5.0 } else { 0.0 });
                     self.selector.draw_xf(gfx, f, &m, i == 1, WHITE);
                 }
             }
@@ -781,11 +951,12 @@ impl Freeplay {
         self.album.draw(gfx, exit * 360.0);
 
         // Overhang bar + texts.
-        let bar_y = Tween::new(-164.0, -100.0, 0.0, 0.3, "quartOut").at(t) + exit_up;
+        let up300 = self.char_select_y(300.0);
+        let bar_y = Tween::new(-164.0, -100.0, 0.0, 0.3, "quartOut").at(ti) + exit_up + up300;
         gfx.rect(0.0, bar_y, VIEW_W, 164.0, [0.0, 0.0, 0.0, 1.0]);
         if let Some(e) = since_intro {
             if e >= 1.0 / 24.0 {
-                let y = 8.0 + exit_up;
+                let y = 8.0 + exit_up + up300;
                 let ost = "Official OST";
                 match &fonts.vcr {
                     Some(vcr) => {
@@ -809,21 +980,80 @@ impl Freeplay {
 
                 // Score panel.
                 if let Some(f) = self.highscore.prefix("highscore small instance 1").frames.first() {
-                    self.highscore.draw(gfx, *f, VIEW_W - 420.0 + exit_right, 70.0, 1.0, WHITE);
+                    self.highscore.draw(gfx, *f, VIEW_W - 420.0 + exit_right, 70.0 + up270, 1.0, WHITE);
                 }
-                for i in 0..7 {
+                // FreeplayScore: digits filled from the right, 0s past the number.
+                let mut n = (self.lerp_score as i64).max(0);
+                for i in (0..7).rev() {
                     let x = VIEW_W - 353.0 + 45.0 * i as f32 + exit_right;
-                    self.score_digits.draw(gfx, 0, e, x, 120.0, 0.4);
+                    self.score_digits.draw(gfx, (n % 10) as usize, e, x, 120.0 + up270, 0.4);
+                    n /= 10;
                 }
-                gfx.sprite(self.clear_box, VIEW_W - 115.0 + exit_right, 65.0, 1.0, WHITE);
-                // txtCompletion "0", right-aligned with offset.x = -24.
-                fonts.clear.draw(gfx, "0", VIEW_W - 95.0 + 24.0 + exit_right, 87.0, 1.0, WHITE);
+                gfx.sprite(self.clear_box, VIEW_W - 115.0 + exit_right, 65.0 + up270, 1.0, WHITE);
+                // txtCompletion, right-aligned by its length.
+                let pct = ((self.lerp_completion * 100.0).floor() as i64).clamp(0, 100).to_string();
+                let off = match pct.len() {
+                    3 => 10.0,
+                    1 => -24.0,
+                    _ => 0.0,
+                };
+                fonts.clear.draw(gfx, &pct, VIEW_W - 95.0 - off + exit_right, 87.0 + up270, 1.0, WHITE);
             }
+        }
+        // charSelectHint: drops in over 0.8 s and pulses between 0.3 and 0.9 alpha.
+        if self.can_char_select {
+            if let Some(font) = &fonts.five_by_seven {
+                let text = "Press [ TAB ] to change characters";
+                let drop = Tween::new(-100.0, 0.0, 0.0, 0.8, "quartOut").at(ti);
+                let y = 18.0 + drop + exit_up + up300;
+                let a = 0.3 + 0.6 * ((t * 2.0).sin() + 1.0) / 2.0;
+                let w = font.width(gfx, text, 32.0);
+                let x = -40.0 + (VIEW_W - 16.0 - w) / 2.0;
+                font.draw(gfx, text, x, y, 32.0, [0x5F as f32 / 255.0, 0x5F as f32 / 255.0, 0x5F as f32 / 255.0, a]);
+            }
+        }
+        self.draw_char_select_fade(gfx);
+    }
+
+    /// The y offset of `exitMoversCharSel` items moving by `-amount`.
+    fn char_select_y(&self, amount: f32) -> f32 {
+        let t = self.time;
+        if let Some(at) = self.to_char_select_at {
+            return -amount * ease_k("backIn", (t - at) / 0.8);
+        }
+        if self.from_char_select {
+            return -amount * (1.0 - ease_k("expoOut", t / (0.8 * 1.2)));
+        }
+        0.0
+    }
+
+    /// The transition gradient and fade for character select, drawn last.
+    fn draw_char_select_fade(&self, gfx: &mut Gfx) {
+        let t = self.time;
+        let (fade, grad_y) = if let Some(at) = self.to_char_select_at {
+            let e = t - at;
+            (1.0 - ease_k("quadIn", e / 0.8), 720.0 - 720.0 * ease_k("backIn", e / 0.8))
+        } else if self.from_char_select {
+            // enterFromCharSel: the gradient starts over the screen and slides down.
+            (ease_k("quadIn", t / 0.8), 720.0 * ease_k("expoOut", t / 1.8))
+        } else {
+            return;
+        };
+        if let Some(g) = self.gradient {
+            if grad_y > -720.0 && grad_y < VIEW_H {
+                gfx.quad_uv(g, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], [[0.0, grad_y], [VIEW_W, grad_y], [VIEW_W, grad_y + 720.0], [0.0, grad_y + 720.0]], WHITE);
+            }
+        }
+        if fade < 1.0 {
+            gfx.set_blend(crate::gfx::Blend::Multiply);
+            gfx.rect(0.0, 0.0, VIEW_W, VIEW_H, [fade * fade, fade * fade, fade, 1.0]);
+            gfx.set_blend(crate::gfx::Blend::Normal);
         }
     }
 
-    fn draw_capsule(&self, gfx: &mut Gfx, fonts: &Fonts, c: &Capsule, selected: bool, jump: f32, exit_x: f32) {
-        let (x, y) = (c.x + exit_x, c.y);
+    #[allow(clippy::too_many_arguments)]
+    fn draw_capsule(&self, gfx: &mut Gfx, fonts: &Fonts, c: &Capsule, selected: bool, jump: f32, exit_x: f32, dy: f32) {
+        let (x, y) = (c.x + exit_x, c.y + dy);
         // Jump-in wobble: 7 frames of x/y squash at 24 fps.
         let k = ((jump.max(0.0) * 24.0) as usize).min(X_FRAMES.len() - 1);
         let xf = X_FRAMES[k];
@@ -857,22 +1087,36 @@ impl Freeplay {
                 let size = 32.0;
                 let w = f.width(gfx, name, size) + 4.0;
                 let h = size * 1.2;
-                let (ox, oy) = (tx + w * (1.0 - sx) / 2.0, ty + h * (1.0 - sy) / 2.0);
+                // checkClipWidth: names wider than the capsule are clipped, and the
+                // selected one scrolls to its end and back (initMove).
+                let too_long = w > CLIP_WIDTH;
+                let scroll = if too_long && selected { capsule_scroll(self.time - self.selected_at, w - CLIP_WIDTH) } else { 0.0 };
+                let (ox, oy) = (tx + w * (1.0 - sx) / 2.0 - scroll, ty + h * (1.0 - sy) / 2.0);
+                if too_long {
+                    gfx.mask(MaskOp::Begin);
+                    gfx.rect(tx, ty - 20.0, CLIP_WIDTH, h + 40.0, WHITE);
+                    gfx.mask(MaskOp::Content);
+                }
                 // A faint halo outside the strokes; the letters themselves stay white.
                 let glow = if selected { 0.12 } else { 0.05 };
                 for r in [4.0f32, 3.0] {
                     for k in 0..8 {
                         let a = k as f32 * std::f32::consts::FRAC_PI_4;
-                        f.draw_scaled(gfx, name, ox + r * a.cos(), oy + r * a.sin(), size, sx, sy, [GLOW[0], GLOW[1], GLOW[2], glow]);
+                        f.draw_scaled(gfx, name, ox + r * a.cos(), oy + r * a.sin(), size, sx, sy, [self.glow[0], self.glow[1], self.glow[2], glow]);
                     }
                 }
                 f.draw_scaled(gfx, name, ox, oy, size, sx, sy, [1.0, 1.0, 1.0, alpha]);
+                if too_long {
+                    gfx.mask(MaskOp::End);
+                    gfx.rect(tx, ty - 20.0, CLIP_WIDTH, h + 40.0, WHITE);
+                    gfx.mask(MaskOp::Done);
+                }
             }
             None => {
                 let ts = 0.5;
                 if selected {
                     for (dx, dy) in [(-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0)] {
-                        fonts.default.draw(gfx, name, tx + dx, ty + dy, ts, fill([GLOW[0], GLOW[1], GLOW[2], 0.45]));
+                        fonts.default.draw(gfx, name, tx + dx, ty + dy, ts, fill([self.glow[0], self.glow[1], self.glow[2], 0.45]));
                     }
                 }
                 fonts.default.draw(gfx, name, tx, ty, ts, fill([1.0, 1.0, 1.0, alpha]));
@@ -927,7 +1171,52 @@ fn ease_k(name: &str, t: f32) -> f32 {
 
 /// `AngleMask` (endPosition.x = 90 texels): hide everything left of the line
 /// from the texture's top-left to (90, bottom).
-fn draw_angle_masked(gfx: &mut Gfx, tex: TexId, cut: f32, x: f32, w: f32, h: f32, color: Color) {
-    let dst = [[x, 0.0], [x + w, 0.0], [x + w, h], [x + w * cut, h]];
+#[allow(clippy::too_many_arguments)]
+/// `CapsuleText.clipWidth` with no rank or favourite icon.
+const CLIP_WIDTH: f32 = 290.0;
+
+/// `CapsuleText.moveTextRight` / `moveTextLeft`: after 0.6 s, 2 s to the end
+/// (sineInOut), 0.3 s pause, 2 s back, 0.3 s pause, repeat.
+fn capsule_scroll(e: f32, dist: f32) -> f32 {
+    let e = e - 0.6;
+    if e <= 0.0 {
+        return 0.0;
+    }
+    let k = e % 4.6;
+    let ease = |x: f32| ease_k("sineInOut", x);
+    match k {
+        k if k < 2.0 => dist * ease(k / 2.0),
+        k if k < 2.3 => dist,
+        k if k < 4.3 => dist * (1.0 - ease((k - 2.3) / 2.0)),
+        _ => 0.0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_angle_masked(gfx: &mut Gfx, tex: TexId, cut: f32, x: f32, y: f32, w: f32, h: f32, color: Color) {
+    let dst = [[x, y], [x + w, y], [x + w, y + h], [x + w * cut, y + h]];
     gfx.quad_uv(tex, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [cut, 1.0]], dst, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Needs real assets: `RUSTED_MIC_TEST_ASSETS=<assets folder> cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn songs_per_character() {
+        let Some(root) = std::env::var_os("RUSTED_MIC_TEST_ASSETS") else { return };
+        let root = std::path::PathBuf::from(root);
+        let assets = Assets::new(root.clone());
+        let players = Players::load(&assets);
+        assert!(players.unlocked_count() >= 2);
+        let registry = SongRegistry::new(&root);
+        for c in ["bf", "pico"] {
+            let songs = list_songs(&registry, &players, c);
+            let names: Vec<String> = songs.iter().map(|s| format!("{}{:?}", s.id, s.charts)).collect();
+            println!("{c}: {} songs: {}", songs.len(), names.join(", "));
+            assert!(!songs.is_empty());
+        }
+    }
 }

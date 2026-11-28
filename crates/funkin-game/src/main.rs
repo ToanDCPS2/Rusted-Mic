@@ -29,10 +29,16 @@ mod setup_screen;
 mod discord;
 mod overlay;
 mod pause;
+mod results;
 mod play;
+mod save;
+mod scripting;
+mod shaders;
+mod dialogue;
 mod settings;
 mod spectrum;
 mod stickers;
+mod video;
 mod world;
 
 use std::path::PathBuf;
@@ -70,7 +76,7 @@ fn positional(args: &[String]) -> Vec<&str> {
             skip = false;
             continue;
         }
-        if a == "--path" || a == "--assets" {
+        if a == "--path" || a == "--assets" || a == "--start" {
             skip = true;
             continue;
         }
@@ -131,7 +137,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 difficulty: pos.get(2).copied().unwrap_or(DEFAULT_DIFFICULTY).to_owned(),
                 variation: pos.get(3).copied().unwrap_or(DEFAULT_VARIATION).to_owned(),
                 playlist: vec![],
-                is_story: false,
+                is_story: args.iter().any(|a| a == "--story"),
                 level_id: None,
             };
             app::run(
@@ -139,6 +145,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 None,
                 Some(req),
                 args.iter().any(|a| a == "--botplay"),
+                flag_value(args, "--start").and_then(|s| s.parse::<f64>().ok()).map_or(0.0, |s| s * 1000.0),
             )
         }
         Some("simulate") => {
@@ -153,8 +160,15 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Resolve the asset root, refusing to continue if no valid assets are available.
+/// Resolve the asset root (with the enabled mods layered over it), refusing
+/// to continue if no valid assets are available.
 fn asset_root(args: &[String]) -> Result<PathBuf, String> {
+    let root = base_asset_root(args)?;
+    load_mods(&root);
+    Ok(root)
+}
+
+fn base_asset_root(args: &[String]) -> Result<PathBuf, String> {
     if let Some(p) = flag_value(args, "--assets") {
         let p = PathBuf::from(p);
         if p.is_file() {
@@ -185,6 +199,8 @@ fn asset_root(args: &[String]) -> Result<PathBuf, String> {
                         }
                     }
                 }
+                // Songs the official build keeps inside its executable (Spaghetti).
+                funkin_assets::embedded::prepare(&m.source_install_dir, &m.asset_root);
                 Ok(m.asset_root)
             }
             funkin_assets::AssetStatus::SetupRequired(why) => {
@@ -196,13 +212,22 @@ fn asset_root(args: &[String]) -> Result<PathBuf, String> {
     Err("built without the importer: pass --assets <path to the game's assets folder>".into())
 }
 
+/// Layer the enabled mods over the assets.
+fn load_mods(root: &std::path::Path) {
+    let mods = menus::mods::enabled_mod_dirs();
+    for m in &mods {
+        log::info!("mod: {}", m.display());
+    }
+    funkin_core::vfs::set_mods(root, mods);
+}
+
 fn boot(args: &[String]) -> Result<(), String> {
     let botplay = args.iter().any(|a| a == "--botplay");
     match asset_root(args) {
-        Ok(root) => app::run(Some(root), None, None, botplay),
+        Ok(root) => app::run(Some(root), None, None, botplay, 0.0),
         // No assets yet: the window opens on the first-run setup screen.
         #[cfg(feature = "importer")]
-        Err(reason) => app::run(None, Some(reason), None, botplay),
+        Err(reason) => app::run(None, Some(reason), None, botplay, 0.0),
         #[cfg(not(feature = "importer"))]
         Err(reason) => Err(reason),
     }

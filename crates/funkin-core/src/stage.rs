@@ -183,6 +183,18 @@ pub struct StageProp {
     /// Tint, e.g. `#FFFFFF`.
     #[serde(default)]
     pub color: Option<String>,
+    /// Texture atlas options.
+    #[serde(default)]
+    pub atlas_settings: AtlasSettings,
+}
+
+/// `atlasSettings` of a texture-atlas prop.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtlasSettings {
+    /// Draw the atlas where it sits in Animate (its stage instance's matrix).
+    #[serde(default)]
+    pub apply_stage_matrix: bool,
 }
 
 /// Port of `StageData`.

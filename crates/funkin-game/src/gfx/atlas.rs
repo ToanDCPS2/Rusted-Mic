@@ -1,5 +1,6 @@
 //! Sparrow v2 texture atlases (`.png` + `.xml`), as used by HaxeFlixel's
-//! `FlxAtlasFrames.fromSparrow`, plus prefix-based animations.
+//! `FlxAtlasFrames.fromSparrow`, Sprite Sheet Packer atlases (`.png` + `.txt`,
+//! `fromSpriteSheetPacker`, e.g. Spirit), plus prefix-based animations.
 
 use std::path::Path;
 
@@ -35,6 +36,16 @@ impl Atlas {
 
     pub fn load_filtered(gfx: &mut Gfx, base: &Path, smooth: bool) -> Result<Self, String> {
         let xml_path = base.with_extension("xml");
+        let txt_path = base.with_extension("txt");
+        if !funkin_core::vfs::exists(&xml_path) && funkin_core::vfs::exists(&txt_path) {
+            let text = funkin_core::vfs::read_to_string(&txt_path).map_err(|e| format!("{}: {e}", txt_path.display()))?;
+            let frames = parse_packer(&text);
+            if frames.is_empty() {
+                return Err(format!("{}: no frames", txt_path.display()));
+            }
+            let texture = gfx.load_texture_filtered(&base.with_extension("png"), smooth)?;
+            return Ok(Self { texture, frames });
+        }
         let texture = gfx.load_texture_filtered(&base.with_extension("png"), smooth)?;
         let text = funkin_core::vfs::read_to_string(&xml_path)
             .map_err(|e| format!("{}: {e}", xml_path.display()))?;
@@ -51,12 +62,20 @@ impl Atlas {
         Self { texture, frames: vec![frame] }
     }
 
-    /// Frames whose name starts with `prefix`, in name order (Flixel's `addByPrefix`).
+    /// Frames whose name starts with `prefix`, in order (Flixel's `addByPrefix`,
+    /// which sorts by the number after the prefix: packer names aren't zero-padded).
     pub fn prefix(&self, prefix: &str) -> Anim {
         let mut idx: Vec<usize> = (0..self.frames.len())
             .filter(|&i| self.frames[i].name.starts_with(prefix))
             .collect();
-        idx.sort_by(|&a, &b| self.frames[a].name.cmp(&self.frames[b].name));
+        // Numeric order when every match is `prefix` + a number (packer names
+        // like `idle spirit_10` aren't zero-padded); otherwise name order.
+        let number = |i: usize| self.frames[i].name[prefix.len()..].parse::<u64>().ok();
+        if idx.iter().all(|&i| number(i).is_some()) {
+            idx.sort_by_key(|&i| number(i));
+        } else {
+            idx.sort_by(|&a, &b| self.frames[a].name.cmp(&self.frames[b].name));
+        }
         Anim { frames: idx }
     }
 
@@ -188,6 +207,18 @@ fn parse_sparrow(text: &str) -> Vec<Frame> {
     frames
 }
 
+/// `FlxAtlasFrames.fromSpriteSheetPacker`: `name = x y width height` per line.
+fn parse_packer(text: &str) -> Vec<Frame> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, rect) = line.split_once('=')?;
+            let n: Vec<f32> = rect.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+            let [x, y, w, h] = n[..] else { return None };
+            Some(Frame { name: name.trim().to_owned(), x, y, w, h, frame_x: 0.0, frame_y: 0.0, frame_w: w, frame_h: h, rotated: false })
+        })
+        .collect()
+}
+
 fn unescape(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -219,5 +250,21 @@ impl Anim {
 
     pub fn duration(&self, fps: f32) -> f32 {
         self.frames.len() as f32 / fps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packer_frames_in_number_order() {
+        let text = "idle spirit_10 = 0 0 128 128\nidle spirit_2 = 129 0 128 128\nidle spirit_0 = 0 129 128 128\nleft_0 = 258 0 120 110\n";
+        let frames = parse_packer(text);
+        assert_eq!(frames.len(), 4);
+        assert_eq!((frames[3].x, frames[3].w, frames[3].h), (258.0, 120.0, 110.0));
+        let atlas = Atlas { texture: TexId(0), frames };
+        let names: Vec<&str> = atlas.prefix("idle spirit_").frames.iter().map(|&i| atlas.frames[i].name.as_str()).collect();
+        assert_eq!(names, ["idle spirit_0", "idle spirit_2", "idle spirit_10"]);
     }
 }

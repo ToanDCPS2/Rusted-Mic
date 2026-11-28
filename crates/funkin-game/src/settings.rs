@@ -43,6 +43,10 @@ pub struct Settings {
     pub psych_health_bar: bool,
     /// Percent (0..=100).
     pub strumline_background: i32,
+    /// New: splashes on sick hits (V-Slice's `Strumline.showNotesplash`).
+    pub note_splashes: bool,
+    /// New: smooth texture filtering; off draws everything nearest-neighbour.
+    pub antialiasing: bool,
     pub flashing_lights: bool,
     pub zoom_camera: bool,
     pub subtitles: bool,
@@ -79,6 +83,8 @@ impl Default for Settings {
             psych_time_bar: false,
             psych_health_bar: false,
             strumline_background: 0,
+            note_splashes: true,
+            antialiasing: true,
             flashing_lights: true,
             zoom_camera: true,
             subtitles: true,
@@ -102,15 +108,13 @@ impl Default for Settings {
     }
 }
 
-/// `%LOCALAPPDATA%\Rusted Mic` (or `RUSTED_MIC_DATA_DIR`).
+/// `%LOCALAPPDATA%\Rusted Mic` on Windows, `~/.local/share/Rusted Mic` on
+/// Linux (or `RUSTED_MIC_DATA_DIR`).
 pub fn data_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("RUSTED_MIC_DATA_DIR") {
         return PathBuf::from(d);
     }
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Rusted Mic")
+    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("Rusted Mic")
 }
 
 pub fn settings_path() -> PathBuf {

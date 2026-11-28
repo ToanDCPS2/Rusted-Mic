@@ -199,7 +199,7 @@ impl PlaySession {
 
         // Strumline.update → updateNotes (hold trails, early releases).
         let mut holds = Vec::new();
-        self.player.update_holds(pos, &mut holds);
+        self.player.update_holds(pos, !self.config.botplay, &mut holds);
         for h in holds.drain(..) {
             if let HoldUpdate::Finished(i) = h {
                 let direction = self.player.notes[i].direction;
@@ -210,7 +210,7 @@ impl PlaySession {
                 });
             }
         }
-        self.opponent.update_holds(pos, &mut holds);
+        self.opponent.update_holds(pos, false, &mut holds);
         for h in holds.drain(..) {
             if let HoldUpdate::Finished(i) = h {
                 let direction = self.opponent.notes[i].direction;
@@ -488,6 +488,21 @@ mod tests {
             t += 1000.0 / 240.0;
         }
         out
+    }
+
+    #[test]
+    fn botplay_hits_everything() {
+        let mut s = session(&[note(500.0, 0, 0.0), note(1000.0, 2, 1000.0), note(2500.0, 3, 0.0)]);
+        s.config.botplay = true;
+        let ev = run(&mut s, 3000.0);
+        let hits = ev
+            .iter()
+            .filter(|e| matches!(e, PlayEvent::NoteHit { side: Side::Player, .. }))
+            .count();
+        assert_eq!(hits, 3);
+        assert!(ev.iter().any(|e| matches!(e, PlayEvent::HoldFinished { side: Side::Player, .. })));
+        assert!(!ev.iter().any(|e| matches!(e, PlayEvent::NoteMiss { .. } | PlayEvent::HoldDropped { .. })));
+        assert_eq!(s.tallies.missed, 0);
     }
 
     #[test]

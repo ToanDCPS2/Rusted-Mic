@@ -11,7 +11,7 @@ use crate::gfx::{Gfx, TexId, VIEW_H, VIEW_W, WHITE};
 use super::{anim, draw_flash, random, screen_camera, Fonts, MenuAction, Music};
 
 /// `freakyMenu` metadata BPM.
-const MENU_BPM: f64 = 102.0;
+pub(crate) const MENU_BPM: f64 = 102.0;
 
 enum Newgrounds {
     Still(TexId, f32),

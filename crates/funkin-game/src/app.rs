@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use funkin_core::scoring::{calculate_rank, tally_completion, ScoringRank};
+use funkin_core::scoring::{calculate_rank, tally_completion, ScoringRank, Tallies};
 use funkin_core::song::SongRegistry;
 use funkin_core::state::{GameState, PlayRequest, SongResult, Transition};
 use winit::application::ApplicationHandler;
@@ -17,9 +17,13 @@ use crate::audio::Audio;
 use crate::discord::{unix_now, Discord, Presence};
 use crate::gfx::ttf::TtfFont;
 use crate::gfx::{Gfx, WHITE};
+use crate::menus::char_select::CharSelect;
+use crate::save::Save;
 use crate::menus::freeplay::{list_songs, Freeplay, FreeplaySong};
+use crate::menus::players::{load_style, Players, DEFAULT_CHARACTER};
 use crate::menus::main_menu::MainMenu;
 use crate::menus::credits::Credits;
+use crate::menus::story::StoryMenu;
 use crate::menus::options::Options;
 use crate::menus::title::Title;
 use crate::menus::{Fonts, MenuAction, Music};
@@ -72,6 +76,21 @@ pub struct App {
     audio: Audio,
     state: GameState,
     songs: Arc<Vec<FreeplaySong>>,
+    /// The character `songs` was listed for.
+    songs_char: String,
+    players: Players,
+    /// The character freeplay shows (`rememberedCharacterId`).
+    freeplay_char: String,
+    /// Character select, open instead of freeplay.
+    char_select: Option<CharSelect>,
+    /// Progress (`Save.hx`): characters seen, the char select intro.
+    save: Save,
+    /// Dev-only `RUSTED_MIC_DEV`: `freeplay` or `charselect` opens that menu at
+    /// launch; `tab@<seconds>` presses freeplay's character select key then, and
+    /// `back@<seconds>` leaves character select; `down@<seconds>` moves freeplay's selection.
+    /// `story` opens story mode, where `down`, `right` and `enter` work; `botplay`
+    /// toggles botplay and `enter` also leaves the results screen.
+    dev: Vec<(String, f32)>,
     music: Music,
     title: Option<Title>,
     main_menu: Option<MainMenu>,
@@ -80,15 +99,27 @@ pub struct App {
     options: Option<Options>,
     /// The credits scroll, open over the main menu state.
     credits: Option<Credits>,
+    /// The mod list (Tab on the main menu), over the main menu.
+    mods: Option<crate::menus::mods::ModMenu>,
     /// Freeplay's selection, kept across songs.
     remembered: Option<(String, String)>,
+    /// The story menu (`StoryMenuState`).
+    story: Option<StoryMenu>,
+    /// Its selected level and difficulty, kept across songs.
+    story_remembered: Option<(String, String)>,
+    /// The week being played (`PlayStatePlaylist.campaignScore` and `Highscore.talliesLevel`).
+    campaign: Option<(i64, Tallies)>,
     play: Option<PlayScene>,
+    /// The results screen (`ResultState`) while in [`GameState::Results`].
+    results: Option<crate::results::Results>,
     pause: Option<PauseMenu>,
     /// Deaths on the current song (`PlayState.deathCounter`).
     deaths: u32,
     loaded: Option<Loaded>,
     error: Option<String>,
     start: Option<PlayRequest>,
+    /// `--start <seconds>` for the first song, in ms.
+    skip_ms: Option<f64>,
     botplay: bool,
     last_frame: Option<Instant>,
     /// When the next frame is due (framerate cap).
@@ -105,6 +136,10 @@ pub struct App {
     /// Unpause the audio when focus comes back.
     resume_on_focus: bool,
     shift: bool,
+    /// `-` and `=` held: pressing both together toggles botplay.
+    combo_keys: [bool; 2],
+    /// The volume before the first key of the botplay shortcut changed it.
+    volume_before_combo: Option<(i32, bool)>,
     cursor: (f32, f32),
     /// The sticker transition out of a song (`StickerSubState`).
     stickers: Option<(Stickers, StickerExit)>,
@@ -120,18 +155,41 @@ pub struct App {
 
 /// Open the game window. With no `asset_root`, the first-run setup screen
 /// comes first and the game starts once the assets are packed.
+/// Launch a fresh copy of the game (same assets folder) for a reboot.
+fn restart_process() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    // Keep only what picks the assets; a `play` command or test flags would
+    // otherwise start a song again.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut keep = vec![];
+    if let Some(i) = args.iter().position(|a| a == "--assets") {
+        keep.extend(args[i..].iter().take(2).cloned());
+    }
+    // The dev launch script would run again (and restart again).
+    match std::process::Command::new(exe).args(keep).env_remove("RUSTED_MIC_DEV").spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("restart: {e}");
+            false
+        }
+    }
+}
+
 pub fn run(
     asset_root: Option<std::path::PathBuf>,
     setup_reason: Option<String>,
     start: Option<PlayRequest>,
     botplay: bool,
+    skip_ms: f64,
 ) -> Result<(), String> {
     #[cfg(not(feature = "importer"))]
     let _ = &setup_reason;
     let needs_setup = asset_root.is_none();
     let asset_root = asset_root.unwrap_or_default();
     let registry = SongRegistry::new(&asset_root);
-    let songs = Arc::new(if needs_setup { Vec::new() } else { list_songs(&registry) });
+    let assets = Assets::new(asset_root);
+    let players = Players::load(&assets);
+    let songs = Arc::new(if needs_setup { Vec::new() } else { list_songs(&registry, &players, DEFAULT_CHARACTER) });
     let settings = Settings::load();
     let audio = Audio::new()?;
     audio.set_master(settings.master_gain());
@@ -141,24 +199,46 @@ pub fn run(
         setup: None,
         #[cfg(feature = "importer")]
         setup_reason: needs_setup.then(|| setup_reason.unwrap_or_default()),
-        assets: Assets::new(asset_root),
+        assets,
         registry,
         audio,
         state: GameState::Title,
         songs,
+        songs_char: DEFAULT_CHARACTER.into(),
+        players,
+        freeplay_char: DEFAULT_CHARACTER.into(),
+        char_select: None,
+        save: Save::load(),
+        dev: std::env::var("RUSTED_MIC_DEV")
+            .map(|v| {
+                v.split(',')
+                    .filter(|c| !c.is_empty())
+                    .map(|c| match c.split_once('@') {
+                        Some((k, t)) => (k.to_owned(), t.parse().unwrap_or(0.0)),
+                        None => (c.to_owned(), 0.0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         music: Music::default(),
         title: None,
         main_menu: None,
         freeplay: None,
         options: None,
         credits: None,
+        mods: None,
         remembered: None,
+        story: None,
+        story_remembered: None,
+        campaign: None,
         play: None,
+        results: None,
         pause: None,
         deaths: 0,
         loaded: None,
         error: None,
         start,
+        skip_ms: (skip_ms > 0.0).then_some(skip_ms),
         botplay,
         last_frame: None,
         next_frame: None,
@@ -171,6 +251,8 @@ pub fn run(
         unfocused: false,
         resume_on_focus: false,
         shift: false,
+        combo_keys: [false, false],
+        volume_before_combo: None,
         cursor: (0.0, 0.0),
         stickers: None,
         sticker_pack: "default".into(),
@@ -203,25 +285,31 @@ fn load_game(mut gfx: Gfx, assets: &Assets) -> Result<Loaded, String> {
     Ok(Loaded { gradient, gfx, fonts, skin, skins: Default::default(), tray, shots, debug: DebugOverlay::new() })
 }
 
-impl Loaded {
-    /// The note skin for a style id (the default one if it isn't loaded).
-    fn skin_for(&self, id: &str) -> &NoteSkin {
-        if id == self.skin.id { &self.skin } else { self.skins.get(id).unwrap_or(&self.skin) }
-    }
-}
-
 impl App {
     /// Assets are ready (at startup, or after setup): load the game and show the title.
     fn enter_game(&mut self, gfx: Gfx, event_loop: &ActiveEventLoop) {
         match load_game(gfx, &self.assets) {
             Ok(mut l) => {
                 l.gfx.set_vsync(self.settings.vsync);
+                l.gfx.antialiasing = self.settings.antialiasing;
                 if self.settings.auto_fullscreen {
                     l.gfx.window().set_fullscreen(Some(Fullscreen::Borderless(None)));
                 }
                 self.loaded = Some(l);
-                if let Some(req) = self.start.take() {
-                    self.start_song(req, false);
+                if let Some(mut req) = self.start.take() {
+                    // `play <song> --story`: carry on through the rest of the song's week.
+                    if req.is_story && req.playlist.is_empty() && req.level_id.is_none() {
+                        if let Some(level) = self.registry.load_levels().into_iter().find(|l| l.songs.contains(&req.song_id)) {
+                            let at = level.songs.iter().position(|s| *s == req.song_id).unwrap();
+                            req.playlist = level.songs[at + 1..].to_vec();
+                            req.level_id = Some(level.id);
+                        }
+                    }
+                    if let Ok(spec) = std::env::var("RUSTED_MIC_DEBUG_RESULTS") {
+                        self.debug_results(req, &spec);
+                    } else {
+                        self.start_song(req, false);
+                    }
                 } else {
                     self.open_title(false);
                 }
@@ -258,8 +346,10 @@ impl App {
             SetupAction::Ready(root) => {
                 let Some((_, Some(gfx))) = self.setup.take() else { return };
                 self.registry = SongRegistry::new(&root);
-                self.songs = Arc::new(list_songs(&self.registry));
                 self.assets = Assets::new(root);
+                self.players = Players::load(&self.assets);
+                self.songs = Arc::new(list_songs(&self.registry, &self.players, DEFAULT_CHARACTER));
+                self.songs_char = DEFAULT_CHARACTER.into();
                 self.last_frame = None;
                 self.enter_game(gfx, event_loop);
             }
@@ -272,6 +362,7 @@ impl App {
         self.audio.set_master(self.settings.master_gain());
         if let Some(l) = self.loaded.as_mut() {
             l.gfx.set_vsync(self.settings.vsync);
+            l.gfx.antialiasing = self.settings.antialiasing;
         }
         if let Some(m) = &mut self.main_menu {
             m.flashing_lights = self.settings.flashing_lights;
@@ -291,17 +382,23 @@ impl App {
             psych_time_bar: s.psych_time_bar,
             psych_health_bar: s.psych_health_bar,
             strumline_bg: s.strumline_background as f32 / 100.0,
+            note_splashes: s.note_splashes,
             zoom_camera: s.zoom_camera,
             subtitles: s.subtitles,
+            naughty: s.naughtyness,
+            skip_ms: 0.0,
+            advance_key: s.controls.keys(Control::CutsceneAdvance).first().map_or("?", |&k| crate::settings::key_label(k)),
         }
     }
 
     fn start_song(&mut self, req: PlayRequest, practice: bool) {
-        let prefs = self.play_prefs();
+        let mut prefs = self.play_prefs();
         let offset = self.settings.global_offset as f64;
         if self.loaded.is_none() {
             return;
         }
+        // `--start`: only the first song launched skips ahead.
+        prefs.skip_ms = self.skip_ms.take().unwrap_or(0.0);
         self.music.stop(&self.audio);
         self.close_pause();
         self.audio.set_paused(false);
@@ -332,6 +429,7 @@ impl App {
                 }
                 self.play = Some(scene);
                 self.freeplay = None;
+                self.story = None;
                 self.play_started = unix_now();
                 if !matches!(self.state, GameState::Play(_)) {
                     if !matches!(self.state, GameState::Freeplay | GameState::StoryMenu) {
@@ -362,6 +460,13 @@ impl App {
         }
     }
 
+    /// Leaving the pause menu: the song plays on, unless a script's cutscene holds it
+    /// (a cancelled countdown keeps the song's audio paused).
+    fn unpause_song(&self) {
+        let held = self.play.as_ref().is_some_and(|p| p.song_held());
+        self.audio.set_paused(held);
+    }
+
     fn close_pause(&mut self) {
         if let Some(mut p) = self.pause.take() {
             p.close(&self.audio);
@@ -374,7 +479,15 @@ impl App {
             return;
         }
         let Some(scene) = &self.play else { return };
+        if !scene.may_pause() {
+            return;
+        }
         self.audio.set_paused(true);
+        let cutscene = scene.video_playing();
+        if let Some(scene) = self.play.as_mut() {
+            scene.pause_video(&self.audio, true);
+        }
+        let Some(scene) = &self.play else { return };
         self.pause = Some(PauseMenu::new(
             &self.audio,
             &self.assets,
@@ -387,6 +500,7 @@ impl App {
             self.deaths,
             scene.practice(),
             self.settings.global_offset,
+            cutscene,
         ));
     }
 
@@ -427,6 +541,22 @@ impl App {
 
     /// Open freeplay (over the main menu).
     fn open_freeplay(&mut self) {
+        self.open_freeplay_from(false);
+    }
+
+    /// Open freeplay; `from_char_select` slides it in from character select.
+    fn open_freeplay_from(&mut self, from_char_select: bool) {
+        if self.players.get(&self.freeplay_char).is_none() {
+            self.freeplay_char = DEFAULT_CHARACTER.into();
+        }
+        if self.songs_char != self.freeplay_char {
+            self.songs = Arc::new(list_songs(&self.registry, &self.players, &self.freeplay_char));
+            self.songs_char = self.freeplay_char.clone();
+            self.remembered = None;
+        }
+        let player = self.players.get(&self.freeplay_char).cloned().unwrap_or_default();
+        let style = load_style(&self.assets, player.freeplay_style.as_deref().unwrap_or(DEFAULT_CHARACTER));
+        let can_char_select = self.players.unlocked_count() > 1;
         let Some(l) = self.loaded.as_mut() else { return };
         if self.main_menu.is_none() {
             if let Ok(mut m) = MainMenu::new(&mut l.gfx, &self.assets, 1) {
@@ -436,9 +566,10 @@ impl App {
             }
         }
         let remembered = self.remembered.as_ref().map(|(s, d)| (s.as_str(), d.as_str()));
-        match Freeplay::new(&mut l.gfx, &self.assets, self.songs.clone(), remembered) {
+        match Freeplay::new(&mut l.gfx, &self.assets, self.songs.clone(), remembered, &player, &style, can_char_select, from_char_select) {
             Ok(mut f) => {
                 f.flashing_lights = self.settings.flashing_lights;
+                f.scores = self.freeplay_scores();
                 self.freeplay = Some(f);
                 self.state = GameState::Freeplay;
             }
@@ -448,6 +579,115 @@ impl App {
                     m.uncover();
                 }
             }
+        }
+    }
+
+    /// Steps the `RUSTED_MIC_DEV` launch script.
+    fn run_dev(&mut self) {
+        if self.dev.is_empty() || self.loaded.is_none() || self.fade.is_some() {
+            return;
+        }
+        let (cmd, at) = self.dev[0].clone();
+        if self.clock < at {
+            return;
+        }
+        self.dev.remove(0);
+        if let Some(m) = &mut self.mods {
+            let code = match cmd.as_str() {
+                "right" => Some(KeyCode::ArrowRight),
+                "left" => Some(KeyCode::ArrowLeft),
+                "down" => Some(KeyCode::ArrowDown),
+                "enter" => Some(KeyCode::Enter),
+                "back" => Some(KeyCode::Escape),
+                "space" => Some(KeyCode::Space),
+                "earlier" => Some(KeyCode::BracketLeft),
+                "later" => Some(KeyCode::BracketRight),
+                "tab" => Some(KeyCode::Tab),
+                _ => None,
+            };
+            if let Some(c) = code {
+                let a = m.key(c, Some(c), &self.audio);
+                self.act(a);
+                return;
+            }
+        }
+        match cmd.as_str() {
+            // A tap of Space for scripts (`FlxG.keys`), e.g. QT's dodge.
+            "space" => {
+                if let Some(s) = self.play.as_mut() {
+                    s.script_key(32, true);
+                    s.script_key(32, false);
+                }
+            }
+            "freeplay" => {
+                self.title = None;
+                self.open_freeplay();
+            }
+            "mods" => {
+                self.title = None;
+                self.open_main_menu();
+                self.act(MenuAction::OpenMods);
+            }
+            "credits" => {
+                self.title = None;
+                self.open_main_menu();
+                if let Some(m) = &mut self.main_menu {
+                    m.covered = true;
+                }
+                self.act(MenuAction::OpenCreditsNow);
+            }
+            "story" => {
+                self.title = None;
+                self.open_main_menu();
+                if let Some(m) = &mut self.main_menu {
+                    m.covered = true;
+                }
+                self.act(MenuAction::OpenStoryNow);
+            }
+            "right" | "enter" if self.story.is_some() => {
+                let code = if cmd == "right" { KeyCode::ArrowRight } else { KeyCode::Enter };
+                if let (Some(s), Some(l)) = (&mut self.story, self.loaded.as_mut()) {
+                    let a = s.key(&mut l.gfx, code, true, &self.audio);
+                    s.key(&mut l.gfx, code, false, &self.audio);
+                    self.act(a);
+                }
+            }
+            "botplay" => self.toggle_botplay(),
+            "enter" if matches!(self.state, GameState::Results(_)) => self.results_accept(),
+            "enter" if self.play.as_ref().is_some_and(|p| p.in_conversation()) => {
+                if let Some(p) = &mut self.play {
+                    p.advance_conversation();
+                }
+            }
+            "charselect" => {
+                self.title = None;
+                self.act(MenuAction::OpenCharSelect(DEFAULT_CHARACTER.into()));
+            }
+            "tab" => {
+                if let Some(f) = &mut self.freeplay {
+                    let a = f.key(KeyCode::F16, &self.audio, &mut self.music);
+                    self.act(a);
+                }
+            }
+            "down" if self.story.is_some() => {
+                if let (Some(s), Some(l)) = (&mut self.story, self.loaded.as_mut()) {
+                    let a = s.key(&mut l.gfx, KeyCode::ArrowDown, true, &self.audio);
+                    self.act(a);
+                }
+            }
+            "down" => {
+                if let Some(f) = &mut self.freeplay {
+                    let a = f.key(KeyCode::ArrowDown, &self.audio, &mut self.music);
+                    self.act(a);
+                }
+            }
+            "back" => {
+                if let Some(c) = &mut self.char_select {
+                    let a = c.key(&self.audio, &mut self.music, Some(KeyCode::Escape), true);
+                    self.act(a);
+                }
+            }
+            other => log::warn!("RUSTED_MIC_DEV: unknown step '{other}'"),
         }
     }
 
@@ -481,7 +721,34 @@ impl App {
                 self.open_title(true);
             }
             MenuAction::OpenFreeplay => self.open_freeplay(),
+            MenuAction::OpenStory => {
+                if !matches!(self.fade, Some(Fade::Out { .. })) {
+                    self.fade = Some(Fade::Out { start: self.clock, then: MenuAction::OpenStoryNow });
+                }
+            }
+            MenuAction::OpenStoryNow => {
+                self.open_story();
+                self.fade = Some(Fade::In { start: self.clock });
+            }
+            MenuAction::CloseStory => {
+                if !matches!(self.fade, Some(Fade::Out { .. })) {
+                    self.fade = Some(Fade::Out { start: self.clock, then: MenuAction::ToMainMenu });
+                }
+            }
             MenuAction::CloseFreeplay => self.close_freeplay(),
+            MenuAction::OpenCharSelect(c) => {
+                if let Some(f) = self.freeplay.take() {
+                    self.remembered = f.remembered().or(self.remembered.take());
+                }
+                let Some(l) = self.loaded.as_mut() else { return };
+                self.char_select = Some(CharSelect::new(&mut l.gfx, &self.assets, &self.audio, &mut self.music, &self.players, &self.save, &c));
+            }
+            MenuAction::CloseCharSelect(c) => {
+                self.char_select = None;
+                self.music.stop(&self.audio);
+                self.freeplay_char = c;
+                self.open_freeplay_from(true);
+            }
             MenuAction::OpenOptions => {
                 if !matches!(self.fade, Some(Fade::Out { .. })) {
                     self.fade = Some(Fade::Out { start: self.clock, then: MenuAction::OpenOptionsNow });
@@ -511,6 +778,28 @@ impl App {
                 Credits::start_music(&self.audio, &self.assets, &mut self.music);
                 self.fade = Some(Fade::In { start: self.clock });
             }
+            MenuAction::OpenMods => {
+                if let (None, Some(l)) = (&self.mods, self.loaded.as_mut()) {
+                    self.mods = Some(crate::menus::mods::ModMenu::new(&mut l.gfx, &self.assets));
+                }
+            }
+            MenuAction::CloseMods => {
+                if let (Some(m), Some(l)) = (self.mods.take(), self.loaded.as_mut()) {
+                    l.gfx.release_textures(m.tex_mark);
+                    if m.needs_restart() {
+                        // A different mod set: start the game over so every
+                        // asset, script and registry loads with it.
+                        let mods = crate::menus::mods::enabled_mod_dirs();
+                        log::info!("mods now: {:?}; restarting", mods.iter().filter_map(|m| m.file_name()).collect::<Vec<_>>());
+                        if restart_process() {
+                            self.quit = true;
+                        } else {
+                            // Couldn't relaunch: re-layer in place (menus and songs opened from now on see it).
+                            funkin_core::vfs::set_mods(self.assets.root(), mods);
+                        }
+                    }
+                }
+            }
             MenuAction::CloseCredits => {
                 if !matches!(self.fade, Some(Fade::Out { .. })) {
                     self.fade = Some(Fade::Out { start: self.clock, then: MenuAction::ToMainMenu });
@@ -534,10 +823,94 @@ impl App {
                 if let Some(f) = &self.freeplay {
                     self.remembered = f.remembered();
                 }
+                if let Some(s) = &self.story {
+                    self.story_remembered = Some(s.remembered());
+                }
+                // A new week: `campaignScore = 0`, `talliesLevel = new Tallies()`.
+                self.campaign = req.is_story.then(|| (0, Tallies::default()));
                 self.start_song(req, false);
             }
             MenuAction::Quit => self.quit = true,
         }
+    }
+
+    /// Open the results screen for a finished song or week.
+    fn open_results(&mut self, r: funkin_core::state::SongResult, (title, player, valid): (String, String, bool)) {
+        let Some(l) = self.loaded.as_mut() else { return };
+        let req = &r.request;
+        let rank = funkin_core::scoring::calculate_rank(&r.tallies);
+        let (title, prev_rank, new_highscore) = if req.is_story {
+            let level = req.level_id.as_deref().unwrap_or("");
+            let name = self.registry.load_levels().into_iter().find(|lv| lv.id == level).map(|lv| lv.name).filter(|n| !n.is_empty()).unwrap_or(title);
+            (name, None, false)
+        } else {
+            let key = format!("{}:{}:{}", req.song_id, req.difficulty, req.variation);
+            let prev = self.save.song_scores.get(&key).cloned();
+            let new_high = valid && prev.as_ref().is_none_or(|p| r.score > p.score);
+            if valid {
+                let e = self.save.song_scores.entry(key).or_default();
+                if r.score > e.score || e.completion == 0.0 {
+                    e.completion = funkin_core::scoring::tally_completion(&r.tallies);
+                }
+                e.score = e.score.max(r.score);
+                if rank > e.rank {
+                    e.rank = rank;
+                }
+                self.save.save();
+            }
+            (title, prev.and_then(|p| p.rank), new_high)
+        };
+        let params = crate::results::ResultsParams {
+            story: req.is_story,
+            title,
+            character_id: player,
+            difficulty: req.difficulty.clone(),
+            score: r.score,
+            tallies: r.tallies,
+            new_highscore,
+            prev_rank,
+            score_valid: valid,
+        };
+        self.music.stop(&self.audio);
+        self.results = Some(crate::results::Results::new(&mut l.gfx, &self.assets, &self.audio, params, self.settings.naughtyness));
+    }
+
+    /// Dev: `RUSTED_MIC_DEBUG_RESULTS=rank[,character]` opens the results
+    /// screen for the requested song with made-up tallies for that rank.
+    fn debug_results(&mut self, req: PlayRequest, spec: &str) {
+        let mut parts = spec.split(',');
+        let rank = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let player = parts.next().map(|c| c.trim().to_owned()).unwrap_or_else(|| "bf".into());
+        // [sick, good, bad, shit, missed] out of 100 notes.
+        let [sick, good, bad, shit, missed] = match rank.as_str() {
+            "gold" | "perfect_gold" => [100, 0, 0, 0, 0],
+            "perfect" => [90, 10, 0, 0, 0],
+            "excellent" => [80, 12, 8, 0, 0],
+            "great" => [70, 15, 15, 0, 0],
+            "good" => [50, 20, 25, 0, 5],
+            _ => [20, 10, 30, 10, 30],
+        };
+        let tallies = Tallies { sick, good, bad, shit, missed, combo: 0, max_combo: sick + good, total_notes_hit: 100 - missed, total_notes: 100 };
+        let score = sick as i64 * 500 + good as i64 * 200 + bad as i64 * 100 + shit as i64 * 50 - missed as i64 * 10;
+        let result = SongResult { request: req, score, tallies, rank: calculate_rank(&tallies) };
+        self.state = GameState::Results(result.clone());
+        self.open_results(result, ("Debug Song by Nobody".into(), player, true));
+    }
+
+    /// Enter on the results screen.
+    fn results_accept(&mut self) {
+        match self.results.as_mut().map(|r| r.accept(&mut self.music)) {
+            Some(Some(crate::results::ResultsExit::Stickers)) | None => self.exit_with_stickers(StickerExit::Results),
+            _ => {}
+        }
+    }
+
+    /// Drop the results screen and its textures.
+    fn close_results(&mut self) {
+        if let (Some(r), Some(l)) = (self.results.take(), self.loaded.as_mut()) {
+            l.gfx.release_textures(r.tex_mark);
+        }
+        self.music.stop(&self.audio);
     }
 
     /// Leave a song (or its game over / results) under the sticker transition.
@@ -559,20 +932,71 @@ impl App {
             StickerExit::Pause => self.leave_play(Transition::Back),
             StickerExit::GameOver => self.leave_play(Transition::Back),
             StickerExit::Results => {
+                self.close_results();
                 self.state.apply(Transition::Confirm);
             }
         }
         self.ensure_freeplay();
     }
 
-    /// Back in freeplay after a song.
+    /// Back in freeplay (or the story menu) after a song.
+    /// Saved bests for the freeplay score panel: `song:difficulty:variation` → (score, completion).
+    fn freeplay_scores(&self) -> std::collections::HashMap<String, (i64, f64)> {
+        self.save.song_scores.iter().map(|(k, v)| (k.clone(), (v.score, v.completion))).collect()
+    }
+
     fn ensure_freeplay(&mut self) {
+        let scores = self.freeplay_scores();
+        if let Some(f) = &mut self.freeplay {
+            f.scores = scores;
+        }
         if matches!(self.state, GameState::Freeplay) && self.freeplay.is_none() {
             self.open_freeplay();
+        }
+        if matches!(self.state, GameState::StoryMenu) && self.story.is_none() {
+            self.open_story();
+        }
+    }
+
+    /// Open the story menu (`StoryMenuState`), over the main menu state.
+    fn open_story(&mut self) {
+        let Some(l) = self.loaded.as_mut() else { return };
+        match StoryMenu::new(&mut l.gfx, &self.assets, &self.registry, self.story_remembered.clone(), self.save.level_scores.clone()) {
+            Ok(s) => {
+                self.story = Some(s);
+                self.state = GameState::StoryMenu;
+                // playMenuMusic: freakyMenu, carrying on if it's already playing.
+                if self.music.id != "freakyMenu" && self.music.play_menu(&self.audio, &self.assets, "freakyMenu", false) {
+                    self.music.fade(0.0, 1.0, 4.0);
+                }
+            }
+            Err(e) => {
+                log::error!("story menu: {e}");
+                self.state = GameState::MainMenu;
+                if let Some(m) = &mut self.main_menu {
+                    m.uncover();
+                }
+            }
         }
     }
 
     /// Keys that work everywhere: fullscreen, screenshot, volume, debug display.
+    /// Botplay on or off, for the current song and the ones after it.
+    fn toggle_botplay(&mut self) {
+        self.botplay = !self.botplay;
+        log::info!("botplay {}", if self.botplay { "on" } else { "off" });
+        if let Some(scene) = &mut self.play {
+            scene.set_botplay(self.botplay);
+        }
+        // Outside a song there's no "Bot Play Enabled" text, so give a sound.
+        if self.play.is_none() {
+            let key = if self.botplay { "default:confirmMenu" } else { "default:cancelMenu" };
+            if let Some(s) = self.assets.sound(key) {
+                self.audio.play_sfx(s, 0.7);
+            }
+        }
+    }
+
     fn global_key(&mut self, code: KeyCode) -> bool {
         let c = &self.settings.controls;
         let Some(l) = self.loaded.as_mut() else { return false };
@@ -622,10 +1046,36 @@ impl App {
             return;
         };
         let pressed = ev.state == ElementState::Pressed;
+        // `-` + `=` together: toggle botplay (the keys are also the volume keys,
+        // so the first key's volume step is undone).
+        let combo = match code {
+            KeyCode::Minus => Some(0),
+            KeyCode::Equal => Some(1),
+            _ => None,
+        };
+        if let Some(i) = combo {
+            if pressed && !ev.repeat && self.combo_keys[1 - i] {
+                self.combo_keys[i] = true;
+                if let Some((v, m)) = self.volume_before_combo.take() {
+                    self.settings.volume = v;
+                    self.settings.muted = m;
+                    self.settings_changed();
+                }
+                self.toggle_botplay();
+                return;
+            }
+            if pressed && !self.combo_keys[i] {
+                self.volume_before_combo = Some((self.settings.volume, self.settings.muted));
+            }
+            self.combo_keys[i] = pressed;
+        }
         if matches!(code, KeyCode::ShiftLeft | KeyCode::ShiftRight) {
             self.shift = pressed;
         }
         let menu = self.settings.controls.menu_key(code);
+        if let (GameState::Play(_), Some(scene), Some(k)) = (&self.state, self.play.as_mut(), crate::scripting::flx_key_code(code)) {
+            scene.script_key(k, pressed);
+        }
 
         // Releases: gameplay and the options menu care about them.
         if !pressed {
@@ -640,6 +1090,12 @@ impl App {
             if let Some(c) = &mut self.credits {
                 let is_pause = self.settings.controls.is(Control::Pause, code);
                 c.key(code, menu, is_pause, false);
+            }
+            if let Some(c) = &mut self.char_select {
+                c.key(&self.audio, &mut self.music, menu, false);
+            }
+            if let (Some(s), Some(m), Some(l)) = (&mut self.story, menu, self.loaded.as_mut()) {
+                s.key(&mut l.gfx, m, false, &self.audio);
             }
             if let Some(o) = &mut self.options {
                 o.key_up(code, menu, &mut self.settings, &self.audio);
@@ -674,8 +1130,19 @@ impl App {
                     }
                     PauseAction::Resume => {
                         scene.set_practice(p.practice());
+                        scene.pause_video(&self.audio, false);
                         self.close_pause();
-                        self.audio.set_paused(false);
+                        self.unpause_song();
+                    }
+                    PauseAction::SkipCutscene => {
+                        scene.skip_video();
+                        self.close_pause();
+                        self.unpause_song();
+                    }
+                    PauseAction::RestartCutscene => {
+                        scene.restart_video();
+                        self.close_pause();
+                        self.unpause_song();
                     }
                     PauseAction::Restart => {
                         let (req, practice) = (scene.request.clone(), p.practice());
@@ -688,6 +1155,15 @@ impl App {
                         self.start_song(req, practice);
                     }
                     PauseAction::Exit => self.exit_with_stickers(StickerExit::Pause),
+                }
+                return;
+            }
+            if !ev.repeat && self.settings.controls.is(Control::CutsceneAdvance, code) {
+                scene.cutscene_advance();
+            }
+            if scene.in_conversation() && self.settings.controls.is(Control::Accept, code) {
+                if !ev.repeat {
+                    scene.advance_conversation();
                 }
                 return;
             }
@@ -714,6 +1190,23 @@ impl App {
             self.act(a);
             return;
         }
+        if let Some(m) = &mut self.mods {
+            let a = m.key(code, menu, &self.audio);
+            self.act(a);
+            return;
+        }
+        // Tab on the main menu: the mod list.
+        if code == KeyCode::Tab && !ev.repeat && matches!(self.state, GameState::MainMenu) && self.fade.is_none() && self.main_menu.as_ref().is_some_and(|m| m.idle()) {
+            self.act(MenuAction::OpenMods);
+            return;
+        }
+        if let Some(c) = &mut self.char_select {
+            if !ev.repeat {
+                let a = c.key(&self.audio, &mut self.music, menu, true);
+                self.act(a);
+            }
+            return;
+        }
         if let Some(o) = &mut self.options {
             let a = o.key_down(code, menu, ev.repeat, &mut self.settings, &self.audio, &mut self.music, &self.assets);
             if std::mem::take(&mut o.dirty) {
@@ -737,6 +1230,10 @@ impl App {
                 Some(f) => f.key(code, &self.audio, &mut self.music),
                 None => MenuAction::None,
             },
+            GameState::StoryMenu => match (&mut self.story, self.loaded.as_mut()) {
+                (Some(s), Some(l)) if !ev.repeat => s.key(&mut l.gfx, code, true, &self.audio),
+                _ => MenuAction::None,
+            },
             GameState::GameOver(req) => {
                 let req = req.clone();
                 let scene = self.play.as_mut().filter(|s| s.has_death());
@@ -759,7 +1256,7 @@ impl App {
             }
             GameState::Results(_) => {
                 if matches!(code, KeyCode::Enter | KeyCode::Escape) {
-                    self.exit_with_stickers(StickerExit::Results);
+                    self.results_accept();
                 }
                 MenuAction::None
             }
@@ -783,6 +1280,7 @@ impl App {
             (GameState::Freeplay, _) => Presence { details: "In the Menus".into(), state: Some("Freeplay".into()), start: None },
             _ if self.options.is_some() => Presence { details: "In the Menus".into(), state: Some("Options".into()), start: None },
             _ if self.credits.is_some() => Presence { details: "In the Menus".into(), state: Some("Credits".into()), start: None },
+            _ if self.mods.is_some() => Presence { details: "In the Menus".into(), state: Some("Mods".into()), start: None },
             _ => Presence { details: "In the Menus".into(), state: None, start: None },
         };
         self.discord.set(Some(p));
@@ -800,8 +1298,9 @@ impl App {
 
         // Gameplay update first, so input → judgement → draw happens in one frame.
         if let (GameState::Play(_), Some(scene), None, false) = (&self.state, self.play.as_mut(), &self.pause, frozen) {
-            let skin = self.loaded.as_ref().unwrap().skin_for(&scene.note_style);
-            match scene.update(&self.audio, skin) {
+            let l = self.loaded.as_mut().unwrap();
+            let skin = if scene.note_style == l.skin.id { &l.skin } else { l.skins.get(&scene.note_style).unwrap_or(&l.skin) };
+            match scene.update(&mut l.gfx, &self.audio, skin) {
                 PlayOutcome::Running => {}
                 PlayOutcome::Died => {
                     // PlayState: the song stops and GameOverSubState opens over the stage.
@@ -827,18 +1326,50 @@ impl App {
                 }
                 PlayOutcome::Finished => {
                     let s = &scene.session;
+                    // ResultsStateParams from PlayState.endSong.
+                    let info = (format!("{} by {}", scene.song_name, scene.artist), scene.player.clone(), !(s.config.botplay || scene.practice()));
                     let result = SongResult {
                         request: scene.request.clone(),
                         score: s.score(),
                         tallies: s.tallies,
                         rank: calculate_rank(&s.tallies),
                     };
+                    if result.request.is_story {
+                        let (score, t) = self.campaign.get_or_insert((0, Tallies::default()));
+                        *score += result.score;
+                        add_tallies(t, &result.tallies);
+                    }
                     self.leave_play(Transition::SongFinished(result));
                     if let GameState::Play(next) = self.state.clone() {
                         // Story playlists continue automatically.
                         self.start_song(next, false);
+                    } else if let GameState::Results(r) = &mut self.state {
+                        // The week is over: its results cover every song, and the best score is kept.
+                        if let (true, Some((score, t))) = (r.request.is_story, self.campaign.take()) {
+                            r.score = score;
+                            r.tallies = t;
+                            r.rank = calculate_rank(&t);
+                            let key = format!("{}:{}", r.request.level_id.as_deref().unwrap_or(""), r.request.difficulty);
+                            if self.save.level_scores.get(&key).is_none_or(|&best| score > best) {
+                                self.save.level_scores.insert(key, score);
+                                self.save.save();
+                            }
+                        }
+                    }
+                    if let GameState::Results(r) = &self.state {
+                        let r = r.clone();
+                        self.open_results(r, info);
                     }
                 }
+            }
+        }
+        // The results screen.
+        if let (GameState::Results(_), Some(r), false, Some(l)) = (&self.state, self.results.as_mut(), frozen, self.loaded.as_mut()) {
+            if let Some(crate::results::ResultsExit::RankUp) = r.update(&mut l.gfx, &self.assets, &self.audio, &mut self.music, dt as f64) {
+                // Faded to black: straight to freeplay.
+                self.close_results();
+                self.state.apply(Transition::Confirm);
+                self.ensure_freeplay();
             }
         }
         // The game over screen.
@@ -881,10 +1412,17 @@ impl App {
             Some(Fade::In { start }) if self.clock - start >= FADE_IN_SECS => self.fade = None,
             Some(Fade::Out { start, then }) if self.clock - start >= FADE_OUT_SECS => {
                 self.fade = None;
-                if matches!(then, MenuAction::ToMainMenu) && (self.options.is_some() || self.credits.is_some()) {
-                    // Leaving options or credits: the main menu comes back interactive.
+                if matches!(then, MenuAction::ToMainMenu) && (self.options.is_some() || self.credits.is_some() || self.story.is_some()) {
+                    // Leaving options, credits or story mode: the main menu comes back interactive.
                     self.options = None;
                     self.credits = None;
+                    if let Some(s) = self.story.take() {
+                        self.story_remembered = Some(s.remembered());
+                        self.state = GameState::MainMenu;
+                        if self.main_menu.is_none() {
+                            self.open_main_menu();
+                        }
+                    }
                     if let Some(m) = &mut self.main_menu {
                         m.uncover();
                     }
@@ -898,6 +1436,8 @@ impl App {
             }
             _ => {}
         }
+
+        self.run_dev();
 
         // Menu updates.
         if !frozen {
@@ -914,10 +1454,24 @@ impl App {
             Some(a)
         } else if let Some(c) = &mut self.credits {
             Some(c.update(dt, self.shift))
+        } else if let Some(m) = &mut self.mods {
+            if let Some(mm) = &mut self.main_menu {
+                mm.update(dt);
+            }
+            Some(m.update(dt))
+        } else if let Some(c) = &mut self.char_select {
+            let gfx = self.loaded.as_mut().map(|l| &mut l.gfx);
+            let a = c.update(dt, gfx, &self.audio, &mut self.music);
+            if let Some(save) = c.take_save() {
+                save.save();
+                self.save = save;
+            }
+            Some(a)
         } else {
             match &self.state {
                 GameState::Title => self.title.as_mut().map(|t| t.update(dt, music_ms)),
                 GameState::MainMenu => self.main_menu.as_mut().map(|m| m.update(dt)),
+                GameState::StoryMenu => self.story.as_mut().map(|s| s.update(dt, music_ms)),
                 GameState::Freeplay => {
                     if let Some(m) = &mut self.main_menu {
                         m.update(dt);
@@ -944,6 +1498,8 @@ impl App {
             o.draw(gfx, fonts, &l.skin, &self.settings);
         } else if let Some(c) = &self.credits {
             c.draw(gfx, fonts.vcr.as_ref());
+        } else if let Some(c) = &self.char_select {
+            c.draw(gfx);
         } else {
             match &self.state {
                 GameState::Play(_) => {
@@ -960,10 +1516,17 @@ impl App {
                     Some(t) => t.draw(gfx, fonts),
                     None => gfx.begin([0.0, 0.0, 0.0, 1.0]),
                 },
+                GameState::StoryMenu => match &self.story {
+                    Some(s) => s.draw(gfx, fonts.vcr.as_ref()),
+                    None => gfx.begin([0.0, 0.0, 0.0, 1.0]),
+                },
                 GameState::MainMenu | GameState::Freeplay => {
                     match &self.main_menu {
                         Some(m) => m.draw(gfx),
                         None => gfx.begin([0.0, 0.0, 0.0, 1.0]),
+                    }
+                    if let (GameState::MainMenu, Some(m)) = (&self.state, &self.mods) {
+                        m.draw(gfx, fonts);
                     }
                     if let (GameState::Freeplay, Some(f)) = (&self.state, &self.freeplay) {
                         f.draw(gfx, fonts);
@@ -986,6 +1549,11 @@ impl App {
                         [1.0, 1.0, 1.0, 0.7],
                     );
                     font.draw_centered(gfx, "ENTER RETRY   ESC BACK", 640.0, 560.0, 0.4, WHITE);
+                }
+                GameState::Results(_) if self.results.is_some() => {
+                    if let Some(r) = &self.results {
+                        r.draw(gfx);
+                    }
                 }
                 GameState::Results(r) => {
                     gfx.begin([0.95, 0.75, 0.25, 1.0]);
@@ -1062,11 +1630,24 @@ impl App {
             self.unfocused = false;
             self.audio.set_master(self.settings.master_gain());
             if std::mem::take(&mut self.resume_on_focus) && self.pause.is_none() {
-                self.audio.set_paused(false);
+                self.unpause_song();
             }
             self.last_frame = None;
         }
     }
+}
+
+/// `Tallies.combine`: a week's tallies across its songs.
+fn add_tallies(a: &mut Tallies, b: &Tallies) {
+    a.sick += b.sick;
+    a.good += b.good;
+    a.bad += b.bad;
+    a.shit += b.shit;
+    a.missed += b.missed;
+    a.combo = b.combo;
+    a.max_combo = a.max_combo.max(b.max_combo);
+    a.total_notes_hit += b.total_notes_hit;
+    a.total_notes += b.total_notes;
 }
 
 fn title_case(s: &str) -> String {
@@ -1151,10 +1732,16 @@ impl ApplicationHandler for App {
                 if let Some(l) = &self.loaded {
                     self.cursor = l.gfx.to_canvas(position.x as f32, position.y as f32);
                 }
+                if let Some(m) = &mut self.mods {
+                    m.mouse_moved(self.cursor.0, self.cursor.1);
+                }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 // Clicking the screenshot preview opens the screenshots folder.
                 let (x, y) = self.cursor;
+                if let Some(m) = &mut self.mods {
+                    m.click(x, y, &self.audio);
+                }
                 if let Some(r) = self.loaded.as_ref().and_then(|l| l.shots.preview_rect) {
                     if x >= r[0] && y >= r[1] && x <= r[0] + r[2] && y <= r[1] + r[3] {
                         let _ = std::process::Command::new("explorer").arg(crate::overlay::screenshot_dir()).spawn();

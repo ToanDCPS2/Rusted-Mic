@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/funkin-core", "crates/funkin-assets", "crates/funkin-game"]
+members = ["crates/funkin-core", "crates/funkin-assets", "crates/funkin-script", "crates/funkin-game", "crates/de265-sys"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false

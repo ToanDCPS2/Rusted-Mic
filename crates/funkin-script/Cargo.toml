@@ -1,0 +1,10 @@
+[package]
+name = "funkin-script"
+description = "An HScript (.hxc) interpreter for Funkin' scripted classes, so mods and the game's own scripts run unchanged."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+log.workspace = true

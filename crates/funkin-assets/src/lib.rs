@@ -14,7 +14,9 @@
 //! The whole crate is optional. The game binary only uses it behind the
 //! `importer` cargo feature, and gameplay code only ever sees an asset root path.
 
+pub mod credits;
 pub mod detect;
+pub mod embedded;
 pub mod fonts;
 pub mod import;
 pub mod marker;

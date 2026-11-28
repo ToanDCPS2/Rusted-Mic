@@ -120,6 +120,21 @@ pub struct NoteSkin {
     pub covers: Vec<(Atlas, [Anim; 3])>,
     pub cover_scale: f32,
     pub cover_off: [f32; 2],
+    /// `NoteSplash` graphics, when the style enables them.
+    pub splash: Option<SplashSkin>,
+}
+
+/// A note style's `noteSplash` (`NoteStyle.buildSplashSprite`).
+pub struct SplashSkin {
+    pub atlas: Atlas,
+    /// Each lane's variants (`splashLEFT1`, `splashLEFT2`, ...).
+    pub anims: [Vec<Anim>; 4],
+    pub scale: f32,
+    pub alpha: f32,
+    pub offsets: [f32; 2],
+    pub framerate: f32,
+    pub variance: i32,
+    pub blend: crate::gfx::Blend,
 }
 
 impl NoteSkin {
@@ -207,6 +222,57 @@ impl NoteSkin {
             }
         }
 
+        // Note splashes.
+        let splash = (|| {
+            use crate::gfx::Blend;
+            if !style.get("noteSplash", &["data", "enabled"]).and_then(|v| v.as_bool()).unwrap_or(false) {
+                return None;
+            }
+            let path = style.asset_path("noteSplash")?;
+            let atlas = match a.atlas_filtered(gfx, path, !style.is_pixel("noteSplash")) {
+                Ok(at) => at,
+                Err(e) => {
+                    log::warn!("note splash: {e}");
+                    return None;
+                }
+            };
+            let anims = ["leftSplashes", "downSplashes", "upSplashes", "rightSplashes"].map(|k| {
+                style
+                    .get("noteSplash", &["data", k])
+                    .and_then(|v| v.as_array())
+                    .map(|v| {
+                        v.iter()
+                            .filter_map(|e| e.get("prefix")?.as_str())
+                            .map(|p| atlas.prefix(p))
+                            .filter(|an| !an.frames.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
+            if anims.iter().any(|v| v.is_empty()) {
+                log::warn!("note style {id}: note splash animations missing in {path}");
+                return None;
+            }
+            log::debug!("note style {id}: splashes {:?}", anims.each_ref().map(|v| v.len()));
+            let num = |k: &str, d: f64| style.get("noteSplash", &["data", k]).and_then(|v| v.as_f64()).unwrap_or(d);
+            let blend = match style.str("noteSplash", &["data", "blendMode"]).unwrap_or("normal") {
+                "add" => Blend::Add,
+                "multiply" => Blend::Multiply,
+                "screen" => Blend::Screen,
+                _ => Blend::Normal,
+            };
+            Some(SplashSkin {
+                anims,
+                scale: style.scale("noteSplash"),
+                alpha: style.get("noteSplash", &["alpha"]).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                offsets: style.offsets("noteSplash"),
+                framerate: num("framerateDefault", 24.0) as f32,
+                variance: num("framerateVariance", 2.0) as i32,
+                blend,
+                atlas,
+            })
+        })();
+
         // Popups.
         let judgement = |gfx: &mut Gfx, n: &str| tex(gfx, &format!("judgement{n}")).ok_or_else(|| format!("note style {id}: no {n} graphic"));
         let ratings = [judgement(gfx, "Sick")?, judgement(gfx, "Good")?, judgement(gfx, "Bad")?, judgement(gfx, "Shit")?];
@@ -250,6 +316,7 @@ impl NoteSkin {
             covers,
             cover_scale: style.scale("holdNoteCover"),
             cover_off: style.offsets("holdNoteCover"),
+            splash,
             notes,
             strum,
             id,

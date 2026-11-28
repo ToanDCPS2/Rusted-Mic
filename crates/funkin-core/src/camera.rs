@@ -123,6 +123,13 @@ pub struct GameCamera {
     pub zoom_rate_offset: f64,
     follow_tween: Option<Tween>,
     zoom_tween: Option<Tween>,
+    /// `FlxCamera.shake`: (intensity, seconds left).
+    shake: Option<(f64, f64)>,
+    /// This frame's shake offset in screen pixels.
+    pub shake_offset: [f64; 2],
+    /// `FlxCamera.targetOffset`: added to the follow point.
+    pub target_offset: [f64; 2],
+    rng: u64,
 }
 
 impl GameCamera {
@@ -142,6 +149,10 @@ impl GameCamera {
             zoom_rate_offset: 0.0,
             follow_tween: None,
             zoom_tween: None,
+            shake: None,
+            shake_offset: [0.0; 2],
+            target_offset: [0.0; 2],
+            rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
 
@@ -151,7 +162,7 @@ impl GameCamera {
     }
 
     fn target_scroll(&self) -> [f64; 2] {
-        [self.follow_point[0] - self.view_w / 2.0, self.follow_point[1] - self.view_h / 2.0]
+        [self.follow_point[0] + self.target_offset[0] - self.view_w / 2.0, self.follow_point[1] + self.target_offset[1] - self.view_h / 2.0]
     }
 
     /// Jump straight to the follow point.
@@ -211,8 +222,35 @@ impl GameCamera {
         }
     }
 
+    /// `FlxCamera.shake(intensity, duration)`: jitter by up to `intensity` of the view size.
+    pub fn shake(&mut self, intensity: f64, duration: f64) {
+        self.shake = Some((intensity, duration));
+    }
+
+    fn rand_signed(&mut self) -> f64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+    }
+
+    /// Advance `shake` and pick this frame's offset.
+    pub fn update_shake(&mut self, elapsed: f64) {
+        self.shake_offset = [0.0; 2];
+        if let Some((i, left)) = self.shake {
+            if left <= 0.0 {
+                self.shake = None;
+            } else {
+                self.shake = Some((i, left - elapsed));
+                let z = self.zoom();
+                self.shake_offset = [self.rand_signed() * i * self.view_w * z, self.rand_signed() * i * self.view_h * z];
+            }
+        }
+    }
+
     /// Per-frame update (decay of bops, follow lerp, tweens).
     pub fn update(&mut self, elapsed: f64) {
+        self.update_shake(elapsed);
         let dt = elapsed * 60.0;
         let decay = 0.95f64.powf(dt);
         if self.zoom_rate > 0.0 {
@@ -252,7 +290,10 @@ impl GameCamera {
         let z = self.zoom();
         let sx = x - self.scroll[0] * scroll_factor[0];
         let sy = y - self.scroll[1] * scroll_factor[1];
-        [self.view_w / 2.0 + (sx - self.view_w / 2.0) * z, self.view_h / 2.0 + (sy - self.view_h / 2.0) * z]
+        [
+            self.view_w / 2.0 + (sx - self.view_w / 2.0) * z + self.shake_offset[0],
+            self.view_h / 2.0 + (sy - self.view_h / 2.0) * z + self.shake_offset[1],
+        ]
     }
 }
 

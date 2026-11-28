@@ -84,7 +84,12 @@ enum Command {
     },
     Stop,
     Sfx(Arc<Pcm>, f32, u64),
+    /// A sound effect starting `f64` source frames in.
+    SfxAt(Arc<Pcm>, f32, u64, f64),
     StopSfx(u64),
+    SfxVolume(u64, f32),
+    /// Hold (or continue) one sound effect where it is.
+    SfxPaused(u64, bool),
     /// Freeze (or continue) the song tracks; sound effects and the overlay keep playing.
     Pause(bool),
     /// A second looping track over everything (the pause menu's music).
@@ -106,6 +111,16 @@ struct Clock {
     /// How many `Play` commands the audio thread has applied; `frame` belongs
     /// to the latest once this matches [`Audio::play`]'s return value.
     generation: AtomicU64,
+}
+
+/// Stops sound effects from wherever it is kept (see [`Audio::sfx_handle`]).
+#[derive(Clone)]
+pub struct SfxHandle(Sender<Command>);
+
+impl SfxHandle {
+    pub fn stop(&self, id: u64) {
+        let _ = self.0.send(Command::StopSfx(id));
+    }
 }
 
 /// Ids for [`Audio::play_sfx_tracked`].
@@ -134,7 +149,8 @@ struct Mixer {
     frame: i64,
     /// Loop region `[start, end)` in ms; the clock keeps counting through it.
     looped: Option<(f64, f64)>,
-    sfx: Vec<(Arc<Pcm>, f64, f32, u64)>,
+    /// (sound, position, volume, id, paused)
+    sfx: Vec<(Arc<Pcm>, f64, f32, u64, bool)>,
     paused: bool,
     overlay: Option<(Arc<Track>, f64)>,
     generation: u64,
@@ -156,8 +172,19 @@ impl Mixer {
                     self.tracks.clear();
                     self.clock.playing.store(false, Ordering::Release);
                 }
-                Command::Sfx(pcm, vol, id) => self.sfx.push((pcm, 0.0, vol, id)),
+                Command::Sfx(pcm, vol, id) => self.sfx.push((pcm, 0.0, vol, id, false)),
+                Command::SfxAt(pcm, vol, id, at) => self.sfx.push((pcm, at, vol, id, false)),
                 Command::StopSfx(id) => self.sfx.retain(|s| s.3 != id),
+                Command::SfxVolume(id, v) => {
+                    for s in self.sfx.iter_mut().filter(|s| s.3 == id) {
+                        s.2 = v;
+                    }
+                }
+                Command::SfxPaused(id, p) => {
+                    for s in self.sfx.iter_mut().filter(|s| s.3 == id) {
+                        s.4 = p;
+                    }
+                }
                 Command::Pause(p) => {
                     self.paused = p;
                     self.clock.paused.store(p, Ordering::Release);
@@ -198,7 +225,10 @@ impl Mixer {
                     r += sr * v;
                 }
             }
-            for (pcm, pos, vol, _) in &mut self.sfx {
+            for (pcm, pos, vol, _, held) in &mut self.sfx {
+                if *held {
+                    continue;
+                }
                 let (sl, sr) = sample(pcm, *pos);
                 l += sl * *vol;
                 r += sr * *vol;
@@ -226,7 +256,7 @@ impl Mixer {
             }
         }
         self.sfx
-            .retain(|(pcm, pos, _, _)| (*pos as usize) < pcm.frames());
+            .retain(|(pcm, pos, _, _, _)| (*pos as usize) < pcm.frames());
     }
 }
 
@@ -358,8 +388,31 @@ impl Audio {
         id
     }
 
+    /// [`Audio::play_sfx_tracked`] from `start_secs` into the sound.
+    pub fn play_sfx_from(&self, pcm: Arc<Pcm>, volume: f32, start_secs: f64) -> u64 {
+        let id = NEXT_SFX.fetch_add(1, Ordering::Relaxed);
+        let at = (start_secs.max(0.0) * pcm.rate as f64).floor();
+        let _ = self.tx.send(Command::SfxAt(pcm, volume, id, at));
+        id
+    }
+
+    /// Change a playing sound effect's volume.
+    pub fn set_sfx_volume(&self, id: u64, volume: f32) {
+        let _ = self.tx.send(Command::SfxVolume(id, volume));
+    }
+
     pub fn stop_sfx(&self, id: u64) {
         let _ = self.tx.send(Command::StopSfx(id));
+    }
+
+    /// Hold a sound effect where it is (`true`) or let it go on.
+    pub fn set_sfx_paused(&self, id: u64, paused: bool) {
+        let _ = self.tx.send(Command::SfxPaused(id, paused));
+    }
+
+    /// A handle that can stop sound effects later, without the `Audio` (on drop).
+    pub fn sfx_handle(&self) -> SfxHandle {
+        SfxHandle(self.tx.clone())
     }
 
     /// The song position (ms) that is audible at `at`.

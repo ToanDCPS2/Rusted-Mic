@@ -123,6 +123,12 @@ pub fn import_installation(
         }
     }
 
+    // Audio and credits the executable embeds, extracted afresh for this install.
+    let _ = fs::remove_file(crate::embedded::embedded_dir().join(".extracted"));
+    let _ = fs::remove_file(crate::embedded::embedded_dir().join(".credits"));
+    let _ = fs::remove_file(crate::embedded::embedded_dir().join("data").join("credits.json"));
+    crate::embedded::prepare(&inst.install_dir, &asset_root);
+
     let marker = InstallMarker {
         schema: MARKER_SCHEMA,
         mode,

@@ -26,12 +26,17 @@ pub enum PauseAction {
     Exit,
     /// The global offset changed (ms).
     Offset(i32),
+    /// Cutscene mode: `VideoCutscene.finishVideo()` / `restartVideo()`.
+    SkipCutscene,
+    RestartCutscene,
 }
 
 #[derive(PartialEq)]
 enum Mode {
     Standard,
     Difficulty,
+    /// Paused during a video cutscene (`PauseMode.Cutscene`).
+    Cutscene,
 }
 
 /// One entry's position: tweened towards its slot in the list.
@@ -89,6 +94,7 @@ impl PauseMenu {
         deaths: u32,
         practice: bool,
         offset: i32,
+        cutscene: bool,
     ) -> Self {
         // `breakfast$musicSuffix`: the Pico mix for Pico's variation.
         let suffix = if variation == "pico" { "-pico" } else { "" };
@@ -96,6 +102,8 @@ impl PauseMenu {
             .or_else(|_| Pcm::load_ogg(&assets.music_path("breakfast")))
             .map(Track::new)
             .ok();
+        // No pause music over a cutscene (its own sound is just held).
+        let music = if cutscene { None } else { music };
         if let Some(m) = &music {
             m.set_volume(0.0);
             // Starts somewhere in the first half of the track.
@@ -103,7 +111,7 @@ impl PauseMenu {
             audio.set_overlay(Some((m.clone(), start)));
         }
         let mut p = Self {
-            mode: Mode::Standard,
+            mode: if cutscene { Mode::Cutscene } else { Mode::Standard },
             entries: Vec::new(),
             sel: 0,
             time: 0.0,
@@ -139,6 +147,7 @@ impl PauseMenu {
                 e.push("Exit to Menu".to_owned());
                 e
             }
+            Mode::Cutscene => vec!["Resume".to_owned(), "Skip Cutscene".to_owned(), "Restart Cutscene".to_owned(), "Exit to Menu".to_owned()],
             Mode::Difficulty => {
                 let mut e: Vec<String> = self.difficulties.iter().map(|d| title_case(d)).collect();
                 e.push("Back".to_owned());
@@ -210,6 +219,10 @@ impl PauseMenu {
                         self.regenerate();
                     }
                     (Mode::Standard, _) => return PauseAction::Exit,
+                    (Mode::Cutscene, "Resume") => return PauseAction::Resume,
+                    (Mode::Cutscene, "Skip Cutscene") => return PauseAction::SkipCutscene,
+                    (Mode::Cutscene, "Restart Cutscene") => return PauseAction::RestartCutscene,
+                    (Mode::Cutscene, _) => return PauseAction::Exit,
                     (Mode::Difficulty, "Back") => {
                         self.mode = Mode::Standard;
                         self.regenerate();

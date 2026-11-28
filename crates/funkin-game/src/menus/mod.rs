@@ -4,10 +4,15 @@
 
 mod album_roll;
 mod bf_card;
+pub mod char_select;
 pub mod credits;
+pub mod mods;
 pub mod freeplay;
 pub mod main_menu;
 pub mod options;
+mod pico_card;
+pub mod players;
+pub mod story;
 pub mod title;
 
 use std::cell::Cell;
@@ -53,6 +58,11 @@ pub enum MenuAction {
     ToTitleNow,
     OpenFreeplay,
     CloseFreeplay,
+    /// Fade out, then open story mode.
+    OpenStory,
+    OpenStoryNow,
+    /// Fade out of story mode back to the main menu.
+    CloseStory,
     /// Fade out, then open the options menu.
     OpenOptions,
     OpenOptionsNow,
@@ -63,9 +73,16 @@ pub enum MenuAction {
     OpenCreditsNow,
     /// Fade out of the credits back to the main menu.
     CloseCredits,
+    /// Tab on the main menu: the mod list, over it.
+    OpenMods,
+    CloseMods,
     /// Save data was cleared: restart from the title (`InitState`).
     Restart,
     Play(funkin_core::state::PlayRequest),
+    /// Freeplay → character select, starting on this character.
+    OpenCharSelect(String),
+    /// Character select → freeplay as this character.
+    CloseCharSelect(String),
     Quit,
 }
 
@@ -239,6 +256,11 @@ impl Music {
     /// Length of the loop region (ms).
     pub fn loop_len_ms(&self) -> f64 {
         self.loop_ms.1 - self.loop_ms.0
+    }
+
+    /// The playing track's audio (for visualizers).
+    pub fn pcm(&self) -> Option<&Pcm> {
+        self.track.as_ref().map(|t| &t.pcm)
     }
 
     /// The current volume (before any fade this frame).
